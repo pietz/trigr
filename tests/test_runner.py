@@ -5,7 +5,7 @@ from trigr.config import DB_PATH
 from trigr.runner import load_task, run_task
 
 
-def _write_task_toml(tasks_dir: Path, name: str, command: str) -> None:
+def _write_task_toml(tasks_dir: Path, name: str, command: str, extra: str = "") -> None:
     toml = f"""
 name = "{name}"
 description = "test task"
@@ -15,9 +15,9 @@ type = "interval"
 interval_seconds = 60
 
 [action]
-type = "script"
 command = "{command}"
 timeout = 10
+{extra}
 """
     (tasks_dir / f"{name}.toml").write_text(toml)
 
@@ -92,3 +92,37 @@ def test_run_task_failure(tmp_path, monkeypatch):
 
     exit_code = run_task("fail-test")
     assert exit_code == 42
+
+
+def test_run_task_with_env(tmp_path, monkeypatch):
+    import trigr.config as cfg
+    monkeypatch.setattr(cfg, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "TASKS_DIR", tmp_path / "tasks")
+    monkeypatch.setattr(cfg, "LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(cfg, "LOCKS_DIR", tmp_path / "locks")
+    monkeypatch.setattr(cfg, "DB_PATH", tmp_path / "history.db")
+
+    import trigr.runner as runner_mod
+    monkeypatch.setattr(runner_mod, "TASKS_DIR", tmp_path / "tasks")
+    monkeypatch.setattr(runner_mod, "LOCKS_DIR", tmp_path / "locks")
+
+    import trigr.store as store_mod
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "history.db")
+
+    (tmp_path / "tasks").mkdir()
+    (tmp_path / "locks").mkdir()
+    cfg.ensure_init()
+
+    _write_task_toml(
+        tmp_path / "tasks", "env-test", "echo $MY_VAR",
+        extra='[action.env]\nMY_VAR = "hello_from_env"',
+    )
+
+    exit_code = run_task("env-test")
+    assert exit_code == 0
+
+    con = sqlite3.connect(tmp_path / "history.db")
+    con.row_factory = sqlite3.Row
+    rows = con.execute("SELECT * FROM runs WHERE task_name = 'env-test'").fetchall()
+    con.close()
+    assert "hello_from_env" in rows[0]["stdout"]

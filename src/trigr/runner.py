@@ -6,10 +6,11 @@ from pathlib import Path
 
 import tomllib
 
-from trigr.config import LOCKS_DIR, TASKS_DIR, ensure_init
-from trigr.models import TaskConfig
+from trigr.config import LOCKS_DIR, OUTPUTS_DIR, TASKS_DIR, ensure_init, load_env
+from trigr.models import PROVIDERS, TaskConfig
 from trigr.notify import send_notification
-from trigr.store import record_run
+from trigr.plist import unload_plist
+from trigr.store import get_consecutive_failures, record_run
 
 
 def load_task(name: str) -> TaskConfig:
@@ -43,67 +44,98 @@ def run_task(name: str) -> int:
     stderr = ""
 
     try:
-        # Execute action
-        cwd = task.action.working_dir
-        if cwd:
-            cwd = str(Path(cwd).expanduser().resolve())
+        try:
+            # Execute action
+            cwd = task.action.working_dir
+            if cwd:
+                cwd = str(Path(cwd).expanduser().resolve())
 
-        if task.action.type == "script":
-            result = subprocess.run(
-                task.action.command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=task.action.timeout,
-                cwd=cwd,
-            )
-            exit_code = result.returncode
-            stdout = result.stdout
-            stderr = result.stderr
+            # Use captured env to isolate from caller's environment
+            env = load_env()
+            env.pop("TRIGR_PATH", None)
+            # Merge task-level environment variables
+            env.update(task.action.env)
 
-        elif task.action.type == "claude":
-            result = subprocess.run(
-                ["claude", "-p", task.action.prompt, "--no-session-persistence"],
-                capture_output=True,
-                text=True,
-                timeout=task.action.timeout,
-                cwd=cwd,
-            )
-            exit_code = result.returncode
-            stdout = result.stdout
-            stderr = result.stderr
+            if task.action.command:
+                result = subprocess.run(
+                    task.action.command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=task.action.timeout,
+                    cwd=cwd,
+                    env=env,
+                )
+                exit_code = result.returncode
+                stdout = result.stdout
+                stderr = result.stderr
 
-    except subprocess.TimeoutExpired:
-        exit_code = 124  # standard timeout exit code
-        stderr = f"Task timed out after {task.action.timeout}s"
-    except Exception as e:
-        exit_code = 1
-        stderr = str(e)
+            elif task.action.prompt:
+                provider_name = task.action.provider or "claude"
+                provider = PROVIDERS[provider_name]
+                if provider_name == "codex":
+                    cmd = [provider["binary"], provider["prompt_flag"], "--skip-git-repo-check", task.action.prompt]
+                else:
+                    cmd = [provider["binary"], provider["prompt_flag"], task.action.prompt]
+                if task.action.model:
+                    cmd.extend([provider["model_flag"], task.action.model])
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=task.action.timeout,
+                    cwd=cwd,
+                    env=env,
+                )
+                exit_code = result.returncode
+                stdout = result.stdout
+                stderr = result.stderr
 
-    finished_at = datetime.now(timezone.utc)
+        except subprocess.TimeoutExpired:
+            exit_code = 124  # standard timeout exit code
+            stderr = f"Task timed out after {task.action.timeout}s"
+        except Exception as e:
+            exit_code = 1
+            stderr = str(e)
 
-    # Record to SQLite
-    record_run(
-        task_name=name,
-        started_at=started_at,
-        finished_at=finished_at,
-        exit_code=exit_code,
-        stdout=stdout,
-        stderr=stderr,
-    )
+        finished_at = datetime.now(timezone.utc)
 
-    # Notify
-    success = exit_code == 0
-    title = task.notify.title or task.name
-    if success and task.notify.on_success:
-        body = stdout[:200] if stdout else "Completed successfully"
-        send_notification(title, body)
-    elif not success and task.notify.on_failure:
-        body = stderr[:200] if stderr else f"Failed with exit code {exit_code}"
-        send_notification(f"FAILED: {title}", body)
+        # Record to SQLite
+        record_run(
+            task_name=name,
+            started_at=started_at,
+            finished_at=finished_at,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
-    # Release lock
-    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-    lock_file.close()
+        # Write output file (click-to-open target for notifications)
+        output_file = OUTPUTS_DIR / f"{name}.md"
+        OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+        output_file.write_text(stdout if stdout else stderr if stderr else "(no output)")
+
+        # Notify
+        success = exit_code == 0
+        title = task.notify.title or task.name
+        if success and task.notify.on_success:
+            body = stdout[:200] if stdout else "Completed successfully"
+            send_notification(title, body, open_path=output_file)
+        elif not success and task.notify.on_failure:
+            streak = get_consecutive_failures(name)
+            body = stderr[:200] if stderr else f"Failed with exit code {exit_code}"
+            send_notification(f"FAILED ({streak}x): {title}", body, open_path=output_file)
+
+            # Auto-disable after too many consecutive failures
+            max_failures = task.notify.max_consecutive_failures
+            if max_failures > 0 and streak >= max_failures:
+                unload_plist(name)
+                send_notification(
+                    f"DISABLED: {title}",
+                    f"Auto-disabled after {streak} consecutive failures",
+                )
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
     return exit_code

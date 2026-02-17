@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import datetime, timezone
 
-from trigr.config import DB_PATH, ensure_init
+from trigr.config import DB_PATH, LOGS_DIR, ensure_init
 
 
 def _connect() -> sqlite3.Connection:
@@ -59,6 +59,48 @@ def get_state(task_name: str) -> str | None:
     ).fetchone()
     con.close()
     return row["last_value"] if row else None
+
+
+def get_last_output(task_name: str) -> dict | None:
+    """Get stdout+stderr of the most recent run for a task."""
+    con = _connect()
+    row = con.execute(
+        "SELECT stdout, stderr, exit_code, finished_at FROM runs WHERE task_name = ? ORDER BY id DESC LIMIT 1",
+        (task_name,),
+    ).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+def delete_old_runs(days: int) -> int:
+    """Delete runs older than N days. Returns count of deleted rows."""
+    con = _connect()
+    cutoff = datetime.now(timezone.utc).isoformat()
+    # Compute cutoff by subtracting days
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    cur = con.execute("DELETE FROM runs WHERE started_at < ?", (cutoff,))
+    deleted = cur.rowcount
+    con.commit()
+    con.close()
+    return deleted
+
+
+def get_consecutive_failures(task_name: str) -> int:
+    """Count consecutive failures from the most recent run backwards."""
+    con = _connect()
+    rows = con.execute(
+        "SELECT exit_code FROM runs WHERE task_name = ? ORDER BY id DESC",
+        (task_name,),
+    ).fetchall()
+    con.close()
+    count = 0
+    for row in rows:
+        if row["exit_code"] != 0:
+            count += 1
+        else:
+            break
+    return count
 
 
 def set_state(task_name: str, value: str) -> None:

@@ -7,6 +7,7 @@ CONFIG_DIR = Path.home() / ".config" / "trigr"
 TASKS_DIR = CONFIG_DIR / "tasks"
 LOGS_DIR = CONFIG_DIR / "logs"
 LOCKS_DIR = CONFIG_DIR / "locks"
+OUTPUTS_DIR = CONFIG_DIR / "outputs"
 DB_PATH = CONFIG_DIR / "history.db"
 ENV_FILE = CONFIG_DIR / "env"
 PLIST_DIR = Path.home() / "Library" / "LaunchAgents"
@@ -17,7 +18,7 @@ ENV_KEYS = ["PATH", "HOME", "SHELL", "USER", "LANG"]
 
 def init() -> None:
     """Create dirs, capture env, init SQLite."""
-    for d in [CONFIG_DIR, TASKS_DIR, LOGS_DIR, LOCKS_DIR]:
+    for d in [CONFIG_DIR, TASKS_DIR, LOGS_DIR, LOCKS_DIR, OUTPUTS_DIR]:
         d.mkdir(parents=True, exist_ok=True)
     PLIST_DIR.mkdir(parents=True, exist_ok=True)
 

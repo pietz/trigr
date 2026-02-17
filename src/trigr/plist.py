@@ -90,10 +90,18 @@ def load_plist(name: str) -> bool:
 def unload_plist(name: str) -> bool:
     """Unload (disable) a plist from launchd. Returns True on success."""
     path = plist_path(name)
-    if not path.exists():
-        return False
+    if path.exists():
+        result = subprocess.run(
+            ["launchctl", "unload", str(path)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return True
+    # Fallback: remove by label (works even if plist file is missing)
+    label = plist_label(name)
     result = subprocess.run(
-        ["launchctl", "unload", str(path)],
+        ["launchctl", "remove", label],
         capture_output=True,
         text=True,
     )
