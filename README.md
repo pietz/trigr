@@ -1,6 +1,10 @@
 # trigr
 
-Lightweight CLI that turns TOML task specs into native macOS `launchd` schedules. No background daemon — launchd *is* the scheduler.
+Schedule LLM prompts on your Mac. Define a trigger and a prompt, and trigr handles the rest — using native `launchd` under the hood, no daemon required.
+
+- Get a morning briefing every day at 8am
+- Summarize new files dropped into a folder
+- Run a shell command on a schedule and get notified if it fails
 
 ## Install
 
@@ -14,56 +18,37 @@ Or from PyPI:
 pipx install trigr
 ```
 
+You'll also need at least one LLM CLI installed: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), or [Gemini CLI](https://github.com/google-gemini/gemini-cli).
+
 ## Quick Start
 
 ```bash
 # Initialize trigr (creates config dirs, captures env)
 trigr init
 
-# Create a task inline
-trigr create morning-news \
+# Morning briefing every day at 8am
+trigr create morning-briefing \
   --trigger cron --hour 8 --minute 0 \
-  --prompt "Summarize today's top 5 tech news in one paragraph" \
+  --prompt "Give me a concise morning briefing: weather in Berlin, top 3 tech news, and any interesting AI developments from the last 24h" \
   --notify-on-success
 
-# Or add from a TOML file
-trigr add backup.toml
+# Describe any new file added to Downloads
+trigr create describe-downloads \
+  --trigger watch --watch-path ~/Downloads \
+  --prompt "A new file was just added to ~/Downloads. List what's new and briefly describe what each file is." \
+  --notify-on-success
 
 # Check your tasks
 trigr list
 ```
 
-## Task Format
+## Examples
 
-Tasks are TOML files with three sections: trigger, action, and (optionally) notify.
-
-### Script Task
-
-```toml
-name = "db-backup"
-description = "Nightly database backup"
-
-[trigger]
-type = "cron"
-
-[trigger.cron]
-hour = 3
-minute = 0
-
-[action]
-command = "pg_dump mydb | gzip > ~/backups/mydb-$(date +%F).sql.gz"
-timeout = 600
-
-[notify]
-on_success = true
-on_failure = true
-```
-
-### LLM Task
+### Morning Briefing
 
 ```toml
 name = "morning-briefing"
-description = "Daily news summary via Claude"
+description = "Daily summary to start the day"
 
 [trigger]
 type = "cron"
@@ -73,29 +58,54 @@ hour = 8
 minute = 0
 
 [action]
-prompt = "Summarize today's top 5 tech news in one paragraph"
-provider = "claude"  # also: codex, gemini
+prompt = "Give me a concise morning briefing: weather in Berlin, top 3 tech news, and any interesting AI developments from the last 24h"
 
 [notify]
 on_success = true
 ```
 
-### File Watcher
+### Describe New Files
 
 ```toml
-name = "lint-on-save"
-description = "Run linter when source files change"
+name = "describe-downloads"
+description = "Summarize new files in Downloads"
 
 [trigger]
 type = "watch"
-watch_paths = ["~/projects/myapp/src"]
+watch_paths = ["~/Downloads"]
 
 [action]
-command = "cd ~/projects/myapp && uv run ruff check ."
-working_dir = "~/projects/myapp"
+prompt = "A new file was just added to ~/Downloads. List what's new and briefly describe what each file is."
+
+[notify]
+on_success = true
 ```
 
-### Interval
+### Periodic Research
+
+```toml
+name = "ai-paper-digest"
+description = "Weekly AI paper roundup"
+
+[trigger]
+type = "cron"
+
+[trigger.cron]
+hour = 18
+minute = 0
+weekday = 5  # Friday
+
+[action]
+prompt = "Find the 5 most interesting AI/ML papers published this week. For each, give the title, one-sentence summary, and why it matters."
+provider = "gemini"
+
+[notify]
+on_success = true
+```
+
+### Script with Failure Alerts
+
+trigr also supports plain shell commands for traditional automation:
 
 ```toml
 name = "health-check"
@@ -113,7 +123,11 @@ on_failure = true
 max_consecutive_failures = 5  # auto-disable after 5 failures in a row
 ```
 
-## Triggers
+## Task Format
+
+Tasks are TOML files with three sections: **trigger**, **action**, and optionally **notify**.
+
+### Triggers
 
 | Type | Fields | Description |
 |------|--------|-------------|
@@ -123,26 +137,26 @@ max_consecutive_failures = 5  # auto-disable after 5 failures in a row
 
 Cron weekdays: 0 = Sunday, 6 = Saturday.
 
-## Actions
+### Actions
 
-Actions are inferred from fields — no `type` field needed:
+Actions are inferred from which field you set — no `type` needed:
 
-- **Script**: Set `command` to run a shell command
-- **LLM**: Set `prompt` to run via an LLM provider CLI (`claude`, `codex`, or `gemini`)
-
-Common options:
+- **`prompt`** — Send to an LLM provider CLI (default: `claude`)
+- **`command`** — Run as a shell command
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `timeout` | `300` | Kill after N seconds |
-| `working_dir` | — | Working directory for the command |
-| `env` | — | Extra environment variables (table) |
-| `provider` | `claude` | LLM provider (only for prompt actions) |
+| `prompt` | — | The prompt to send to the LLM |
+| `command` | — | Shell command to execute |
+| `provider` | `claude` | LLM provider: `claude`, `codex`, or `gemini` |
 | `model` | — | Override the provider's default model |
+| `timeout` | `300` | Kill after N seconds |
+| `working_dir` | — | Working directory |
+| `env` | — | Extra environment variables (table) |
 
-## Notifications
+### Notifications
 
-trigr sends macOS notifications via `terminal-notifier` (preferred) or `osascript` (fallback).
+trigr sends macOS notifications via `terminal-notifier` (preferred) or `osascript` (fallback). Click a notification to see the full output.
 
 ```toml
 [notify]
@@ -157,17 +171,16 @@ max_consecutive_failures = 5  # auto-disable after N failures (0 = never)
 | Command | Description |
 |---------|-------------|
 | `trigr init` | Create config dirs and capture environment |
-| `trigr add <file.toml>` | Register task, generate plist, load into launchd |
-| `trigr create <name> --trigger ... --command/--prompt ...` | Create a task inline |
+| `trigr add <file.toml>` | Register task from TOML file |
+| `trigr create <name> --trigger ... --prompt/--command ...` | Create a task inline |
 | `trigr remove <name>` | Unload and delete a task |
-| `trigr enable <name>` | Load task into launchd |
-| `trigr disable <name>` | Unload task from launchd |
+| `trigr enable/disable <name>` | Load/unload in launchd |
 | `trigr list [--json]` | Show all tasks with status |
 | `trigr show <name> [--json]` | Show full task config |
 | `trigr logs [name] [-n 20] [--json]` | Show run history |
-| `trigr output <name> [--stderr]` | Show last run's stdout/stderr |
+| `trigr output <name> [--stderr]` | Show last run's output |
 | `trigr run <name>` | Execute a task immediately |
-| `trigr edit <name>` | Edit task TOML in $EDITOR, re-validate on save |
+| `trigr edit <name>` | Edit TOML in $EDITOR, re-validate on save |
 | `trigr validate <file.toml>` | Check a TOML file without registering |
 | `trigr refresh` | Re-capture env and regenerate all plists |
 | `trigr status [--json]` | Show currently-running tasks |
@@ -176,17 +189,12 @@ max_consecutive_failures = 5  # auto-disable after N failures (0 = never)
 ## How It Works
 
 ```
-TOML task → trigr add → launchd plist → launchd fires → trigr run → execute → log + notify
+TOML task → trigr add → launchd plist → launchd fires → trigr run → LLM/script → log + notify
 ```
 
-trigr generates native `launchd` plist files in `~/Library/LaunchAgents/`. When launchd triggers a task, it calls `trigr run <name>`, which:
+trigr compiles your task definitions into native `launchd` plists. When a trigger fires, launchd calls `trigr run`, which executes the prompt or command, records the result in SQLite, and sends a macOS notification.
 
-1. Acquires a file lock (skips if already running)
-2. Runs the command or LLM prompt
-3. Records the result in SQLite
-4. Sends a macOS notification on success/failure
-
-Environment variables are captured at `trigr init` time and baked into plists, so tasks run with consistent PATH and env regardless of how launchd invokes them. Run `trigr refresh` after changing your PATH or upgrading trigr.
+Environment is captured at `trigr init` time and baked into plists — so your LLM CLIs work reliably even when invoked by launchd. Run `trigr refresh` after PATH changes or upgrading trigr.
 
 ## License
 
