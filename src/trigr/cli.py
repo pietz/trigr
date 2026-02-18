@@ -48,15 +48,16 @@ def _load_task_from_file(path: Path) -> TaskConfig:
     return TaskConfig(**data)
 
 
-def _all_tasks() -> list[TaskConfig]:
+def _all_tasks() -> tuple[list[TaskConfig], list[tuple[Path, str]]]:
     """Load all task configs from the tasks directory."""
     tasks: list[TaskConfig] = []
+    invalid_tasks: list[tuple[Path, str]] = []
     for toml_file in sorted(TASKS_DIR.glob("*.toml")):
         try:
             tasks.append(_load_task_from_file(toml_file))
-        except Exception:
-            pass
-    return tasks
+        except Exception as exc:
+            invalid_tasks.append((toml_file, str(exc)))
+    return tasks, invalid_tasks
 
 
 @app.command(name="init")
@@ -89,8 +90,17 @@ def add(file: Path) -> None:
 
     # Load into launchd if enabled
     if task.enabled:
-        load_plist(task.name)
-        console.print(f"Added and loaded task '{task.name}'.", style="green")
+        if load_plist(task.name):
+            console.print(f"Added and loaded task '{task.name}'.", style="green")
+        else:
+            console.print(
+                f"Added task '{task.name}', but failed to load it into launchd.",
+                style="red",
+            )
+            console.print("Run `trigr enable <name>` after fixing launchd errors.", style="yellow")
+            console.print(f"  TOML: {dest}")
+            console.print(f"  Plist: {plist_file}")
+            raise typer.Exit(1)
     else:
         console.print(f"Added task '{task.name}' (disabled).", style="yellow")
 
@@ -152,7 +162,13 @@ def list_cmd(
 ) -> None:
     """List all tasks with status and last run info."""
     ensure_init()
-    tasks = _all_tasks()
+    tasks, invalid_tasks = _all_tasks()
+
+    for invalid_file, error in invalid_tasks:
+        typer.echo(
+            f"Warning: skipping invalid task file '{invalid_file.name}': {error}",
+            err=True,
+        )
 
     if as_json:
         output = []
@@ -352,7 +368,12 @@ def edit(name: str) -> None:
 def refresh() -> None:
     """Re-capture env, regenerate and reload all plists."""
     init()
-    tasks = _all_tasks()
+    tasks, invalid_tasks = _all_tasks()
+    for invalid_file, error in invalid_tasks:
+        console.print(
+            f"Skipping invalid task file '{invalid_file.name}': {error}",
+            style="yellow",
+        )
     count = 0
     for task in tasks:
         was_loaded = is_loaded(task.name)
@@ -466,7 +487,7 @@ def clean(
 def create(
     name: str,
     # Trigger options
-    trigger: str = typer.Option(..., help="Trigger type: cron, interval, or watch"),
+    trigger: TriggerType = typer.Option(..., help="Trigger type"),
     hour: int | None = typer.Option(None, help="Cron hour (0-23)"),
     minute: int | None = typer.Option(None, help="Cron minute (0-59)"),
     day: int | None = typer.Option(None, help="Cron day of month (1-31)"),
@@ -493,7 +514,7 @@ def create(
     ensure_init()
 
     # Build trigger config
-    trigger_type = TriggerType(trigger)
+    trigger_type = trigger
     cron_schedule = None
     if trigger_type == TriggerType.cron:
         cron_schedule = CronSchedule(
@@ -548,7 +569,7 @@ def create(
     if description:
         data["description"] = description
 
-    trigger_data: dict = {"type": trigger}
+    trigger_data: dict = {"type": trigger_type.value}
     if trigger_type == TriggerType.interval:
         trigger_data["interval_seconds"] = interval_seconds
     elif trigger_type == TriggerType.watch and watch_paths:
@@ -591,7 +612,16 @@ def create(
 
     # Generate plist and load
     plist_file = write_plist(task)
-    load_plist(name)
+    if not load_plist(name):
+        console.print(
+            f"Created task '{name}', but failed to load it into launchd.",
+            style="red",
+        )
+        console.print("Run `trigr enable <name>` after fixing launchd errors.", style="yellow")
+        console.print(f"  TOML: {dest}")
+        console.print(f"  Plist: {plist_file}")
+        raise typer.Exit(1)
+
     console.print(f"Created and loaded task '{name}'.", style="green")
     console.print(f"  TOML: {dest}")
     console.print(f"  Plist: {plist_file}")
