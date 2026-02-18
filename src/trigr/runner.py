@@ -1,6 +1,8 @@
 import fcntl
+import shutil
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,6 +44,7 @@ def run_task(name: str) -> int:
     exit_code = 1
     stdout = ""
     stderr = ""
+    session_id: str | None = None
 
     try:
         try:
@@ -79,6 +82,10 @@ def run_task(name: str) -> int:
                     cmd = [provider["binary"], provider["prompt_flag"], task.action.prompt]
                 if task.action.model:
                     cmd.extend([provider["model_flag"], task.action.model])
+                # Generate a session ID for Claude so we can resume it
+                if provider_name == "claude":
+                    session_id = str(uuid.uuid4())
+                    cmd.extend(["--session-id", session_id])
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
@@ -115,16 +122,28 @@ def run_task(name: str) -> int:
         OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
         output_file.write_text(stdout if stdout else stderr if stderr else "(no output)")
 
+        # Build click action for notification
+        # For Claude LLM tasks: click resumes the session in Terminal
+        # For everything else: click opens the output file
+        execute_cmd: str | None = None
+        if task.action.prompt and session_id:
+            claude_bin = shutil.which("claude") or "claude"
+            resume_cmd = f'{claude_bin} --resume {session_id}'
+            execute_cmd = (
+                f'osascript -e \'tell application "Terminal" to do script "{resume_cmd}"\' '
+                f'-e \'tell application "Terminal" to activate\''
+            )
+
         # Notify
         success = exit_code == 0
         title = task.notify.title or task.name
         if success and task.notify.on_success:
             body = stdout[:200] if stdout else "Completed successfully"
-            send_notification(title, body, open_path=output_file)
+            send_notification(title, body, open_path=output_file, execute=execute_cmd)
         elif not success and task.notify.on_failure:
             streak = get_consecutive_failures(name)
             body = stderr[:200] if stderr else f"Failed with exit code {exit_code}"
-            send_notification(f"FAILED ({streak}x): {title}", body, open_path=output_file)
+            send_notification(f"FAILED ({streak}x): {title}", body, open_path=output_file, execute=execute_cmd)
 
             # Auto-disable after too many consecutive failures
             max_failures = task.notify.max_consecutive_failures

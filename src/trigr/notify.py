@@ -3,12 +3,22 @@ import subprocess
 from pathlib import Path
 
 
-def send_notification(title: str, body: str, open_path: Path | None = None) -> None:
-    """Send a macOS notification. Clicking opens open_path if provided."""
+def send_notification(
+    title: str,
+    body: str,
+    open_path: Path | None = None,
+    execute: str | None = None,
+) -> None:
+    """Send a macOS notification.
+
+    Clicking runs `execute` command if provided, otherwise opens `open_path`.
+    """
     notifier = shutil.which("terminal-notifier")
     if notifier:
         cmd = [notifier, "-title", title, "-message", body, "-group", "trigr"]
-        if open_path:
+        if execute:
+            cmd.extend(["-execute", execute])
+        elif open_path:
             cmd.extend(["-open", f"file://{open_path}"])
         subprocess.run(cmd, capture_output=True, timeout=10)
     else:

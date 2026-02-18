@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 from datetime import datetime
+from importlib.metadata import version as pkg_version
 from pathlib import Path
 
 import tomli_w
@@ -19,8 +20,25 @@ from trigr.plist import is_loaded, load_plist, plist_path, remove_plist, unload_
 from trigr.runner import run_task
 from trigr.store import delete_old_runs, get_last_output, get_runs
 
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"trigr {pkg_version('trigr')}")
+        raise typer.Exit()
+
+
 app = typer.Typer(help="Compile task specs into launchd schedules.", no_args_is_help=True)
 console = Console()
+
+
+@app.callback()
+def _main(
+    version: bool = typer.Option(
+        False, "--version", "-v", help="Show version and exit.",
+        callback=_version_callback, is_eager=True,
+    ),
+) -> None:
+    """trigr — lightweight launchd task scheduler."""
 
 
 def _load_task_from_file(path: Path) -> TaskConfig:
@@ -466,6 +484,7 @@ def create(
     # Notify options
     notify_on_success: bool = typer.Option(False, "--notify-on-success", help="Notify on success"),
     notify_on_failure: bool = typer.Option(True, "--notify-on-failure", help="Notify on failure"),
+    notify_title: str | None = typer.Option(None, "--notify-title", help="Custom notification title"),
     max_consecutive_failures: int = typer.Option(0, "--max-failures", help="Auto-disable after N failures (0=never)"),
     # Task options
     description: str = typer.Option("", help="Task description"),
@@ -501,6 +520,7 @@ def create(
     notify_config = NotifyConfig(
         on_success=notify_on_success,
         on_failure=notify_on_failure,
+        title=notify_title,
         max_consecutive_failures=max_consecutive_failures,
     )
 
@@ -561,6 +581,8 @@ def create(
         "on_success": notify_on_success,
         "on_failure": notify_on_failure,
     }
+    if notify_title:
+        notify_data["title"] = notify_title
     if max_consecutive_failures > 0:
         notify_data["max_consecutive_failures"] = max_consecutive_failures
     data["notify"] = notify_data
