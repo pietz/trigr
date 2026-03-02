@@ -2,20 +2,28 @@
 
 **Make any AI coding agent autonomous.**
 
-AI coding agents like Claude Code are reactive — they only work when a human types a message. Frameworks like OpenClaw solve this with a full platform, but sometimes you just want to add events to the agent you already use.
+AI coding agents like Claude Code are **reactive**. They only do something when prompted.
 
-**trigr** is a lightweight event system that delivers events *into* a running agent session. The agent calls `trigr watch`, goes to sleep, and wakes up when something happens.
+OpenClaw changes that by running agents in the background, but it's a full platform you have to self-host, with [known security risks](https://www.kaspersky.com/blog/openclaw-vulnerabilities-exposed/55263/) around exposed instances and malicious plugins.
 
+**trigr** bridges this gap through a simple trigger system. It lets the agent wait for events to autonomously run tasks when something happens. Once it's done, it goes back to sleep until the next event.
+
+## Quickstart
+
+1. The agent starts trigr as a background command.
+
+```bash
+uvx trigr watch
+# trigr server runs on port 9374 (default)
 ```
-Agent runs trigr watch (background task or blocking)
-    → blocks until event
-    → event arrives → prints JSON → exits
-    → agent wakes up, processes event
-    → agent runs trigr watch again
-    → "asleep" until next event
+
+2. An external event is emitted.
+
+```bash
+uvx trigr emit "New GitHub issue opened: #1337 - Please triage."
 ```
 
-One tool. One pattern. Works with Claude Code, Codex, and Gemini CLI.
+3. The agent wakes up and runs the task.
 
 ## Install
 
@@ -23,146 +31,81 @@ One tool. One pattern. Works with Claude Code, Codex, and Gemini CLI.
 uv tool install trigr
 ```
 
-## Quick Start
+## Triggers
+
+We currently support 3 types of triggers: messages, CRON jobs, and pollers.
+
+## Messages (External Triggers)
+
+You can send messages from another terminal, script, or the agent itself.
 
 ```bash
-# Initialize trigr in your project
-trigr init
-
-# Terminal 1: watch for events (auto-starts server)
-trigr watch
-
-# Terminal 2: send an event
-trigr emit hello --data '{"msg": "world"}'
-# → Terminal 1 prints the event JSON and exits
+trigr emit "New GitHub issue opened: #1337 - Please triage."
 ```
 
-## Agent Integration
-
-### Claude Code
-
-`trigr watch` runs as a background task — the agent can chat with the user while waiting for events. When an event arrives, the background task exits and the agent gets notified.
+You can delay messages too, if you want the agent to wait before acting.
 
 ```bash
-# In a Claude Code skill or agent instruction:
-# "Run trigr watch as a background task. When it completes, process the event and restart."
-trigr watch --timeout 3600
+trigr emit "Check if the deployment ran successfully and fix if needed." --delay 20m
 ```
 
-### Codex CLI / Gemini CLI
+## CRON Jobs (Scheduled Triggers)
 
-`trigr watch` runs as a blocking call. The agent waits for the next event, processes it, and restarts the loop.
-
-| Agent | How trigr watch runs | Background chatting? |
-|-------|---------------------|---------------------|
-| Claude Code | Background task | Yes |
-| Codex CLI | Blocking call | No (not needed) |
-| Gemini CLI | Blocking call | No |
-
-## Event Sources
-
-trigr supports three ways to produce events:
-
-### 1. Manual / Programmatic
-
-Anything can POST events — other terminals, scripts, webhooks, other agents:
+CRON jobs run at a specific time schedule.
 
 ```bash
-trigr emit code_review --data '{"pr": 42, "repo": "myapp"}'
+trigr add daily-news --cron "0 9 * * *" --message "Retrieve the top 5 trending hacker news stories."
 ```
 
-### 2. Pollers
+You can also prompt the agent to run a command and use its output as the message.
 
-Shell commands that run on an interval. If stdout is non-empty, it becomes an event:
+```bash
+trigr add daily-news --cron "0 9 * * *" --command "python daily_news.py"
+```
+
+Instead of using the CLI, you can also define cron jobs in `trigr.toml`.
+
+```toml
+[crons.daily-report]
+cron = "0 9 * * *"
+command = "echo 'time for the daily report'"
+```
+
+## Pollers (Interval Triggers)
+
+Pollers run at regular intervals, like every 5 minutes to check your email.
+
+```bash
+trigr add email-response --interval 300 --command "./check_email.sh"
+```
+
+If a command prints nothing, no message is created. Pollers silently skip cycles when nothing is new.
 
 ```toml
 [pollers.check-inbox]
 interval = 60
-command = "python check_mail.py"
-```
-
-### 3. Cron Jobs
-
-Shell commands on a cron schedule:
-
-```toml
-[crons.daily-summary]
-cron = "0 9 * * *"
-command = "python daily_report.py"
-```
-
-Pollers and cron commands are language-agnostic. Write a script in any language that prints JSON to stdout. trigr runs it on schedule.
-
-### Delayed Events
-
-The agent can schedule its own future events — perfect for follow-ups:
-
-```bash
-# "Follow up in 48 hours if no response"
-trigr emit followup --data '{"candidate": "C-4821"}' --delay 48h
-
-# Supported units: s (seconds), m (minutes), h (hours), d (days)
-```
-
-## trigr.toml
-
-Project-local configuration. Created by `trigr init`.
-
-```toml
-[server]
-host = "127.0.0.1"
-port = 9374
-
-[pollers.check-inbox]
-interval = 60
-command = "python check_mail.py"
-
-[crons.morning-sync]
-cron = "0 9 * * *"
-command = "echo '{\"type\": \"morning\"}'"
-```
-
-Add jobs from the CLI:
-
-```bash
-trigr add inbox-check --interval 60 --command "python check_mail.py"
-trigr add daily-report --cron "0 9 * * *" --command "python report.py"
+command = "./check_mail.sh"
 ```
 
 ## Commands
 
-| Command | Description |
+| Command | What it does |
 |---------|-------------|
-| `trigr init` | Create `trigr.toml` in the current directory |
-| `trigr serve [-f]` | Start server (detached by default, `-f` foreground) |
-| `trigr watch [--timeout 300]` | Block until event, print JSON, exit |
-| `trigr emit <type> [--data '{}'] [--delay 10s]` | Push event to queue |
-| `trigr add <name> -c "cmd" (--interval N \| --cron "...")` | Add poller/cron to config |
+| `trigr watch [--timeout 300]` | Block until message, print it, exit |
+| `trigr emit "msg" [--delay 10s]` | Send a message |
+| `trigr add <name> --interval N -m "msg"` | Add a poller with a static message |
+| `trigr add <name> --cron "..." -c "cmd"` | Add a cron job with a command |
 | `trigr status` | Show server state |
+| `trigr init` | Create `trigr.toml` (auto-created on first use) |
+| `trigr serve [-f]` | Start server manually |
 
-## How It Works
+## Agent Compatibility
 
-```
-trigr serve → FastAPI server + APScheduler
-                ├── POST /emit    (push events to priority queue)
-                ├── GET  /next    (long-poll, blocks until event ready)
-                └── GET  /status  (queue depth, registered jobs)
-```
-
-Events sit in an in-memory priority queue sorted by delivery time. `GET /next` blocks until an event whose `fire_at` has passed, then returns it as JSON.
-
-The server auto-starts when you run `trigr watch` or `trigr emit`. A `.trigr.pid` file lives next to `trigr.toml`, so multiple projects can run independent servers on different ports.
-
-## Poller Output Format
-
-Poller commands should print JSON to stdout. If the JSON has a `type` field, it's used as the event type. Otherwise it defaults to `poller.<name>`.
-
-```bash
-# Poller script example
-echo '{"type": "new_email", "data": {"from": "jane@example.com", "subject": "Re: Role"}}'
-```
-
-If stdout is empty, no event is created. This lets pollers silently skip cycles when nothing is new.
+| Agent | How `trigr watch` runs | Chat while waiting? |
+|-------|----------------------|---------------------|
+| Claude Code | Background task | Yes |
+| Codex CLI | Blocking call | No |
+| Gemini CLI | Blocking call | No |
 
 ## License
 

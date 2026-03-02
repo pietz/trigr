@@ -25,9 +25,7 @@ class TrigrConfig(BaseModel):
 
 
 class Event(BaseModel):
-    type: str
-    source: str = ""
-    data: dict = {}
+    message: str
     timestamp: datetime = None  # type: ignore[assignment]
 
     def __init__(self, **kwargs: object) -> None:
@@ -37,7 +35,5 @@ class Event(BaseModel):
 
 
 class EmitRequest(BaseModel):
-    type: str
-    data: dict = {}
-    source: str = ""
+    message: str
     fire_at: datetime | None = None

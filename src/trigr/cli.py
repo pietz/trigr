@@ -1,7 +1,5 @@
-import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import time
@@ -18,6 +16,8 @@ from rich.console import Console
 app = typer.Typer(help="Event system for AI CLI agents.", no_args_is_help=True)
 console = Console()
 
+DEFAULT_PORT = 9374
+
 DEFAULT_CONFIG = """\
 [server]
 host = "127.0.0.1"
@@ -25,11 +25,11 @@ port = 9374
 
 # [pollers.example]
 # interval = 60
-# command = "echo '{\\"type\\": \\"tick\\"}'"
+# command = "echo 'something changed'"
 
 # [crons.example]
 # cron = "0 9 * * *"
-# command = "echo '{\\"type\\": \\"morning\\"}'"
+# command = "echo 'time for the daily report'"
 """
 
 
@@ -65,12 +65,12 @@ def _load_toml() -> dict:
         return tomllib.load(f)
 
 
-def _server_url() -> str:
+def _server_url(port: int | None = None) -> str:
     data = _load_toml()
     server = data.get("server", {})
     host = server.get("host", "127.0.0.1")
-    port = server.get("port", 9374)
-    return f"http://{host}:{port}"
+    resolved_port = port or server.get("port", DEFAULT_PORT)
+    return f"http://{host}:{resolved_port}"
 
 
 def _parse_delay(delay: str) -> datetime:
@@ -85,12 +85,14 @@ def _parse_delay(delay: str) -> datetime:
     return datetime.now() + delta
 
 
-def _start_detached() -> int:
+def _start_detached(port: int | None = None) -> int:
     """Spawn 'trigr serve -f' as a background process. Returns PID."""
-    # Find the trigr executable
     trigr_bin = sys.argv[0] if os.path.isfile(sys.argv[0]) else "trigr"
+    cmd = [trigr_bin, "serve", "-f"]
+    if port:
+        cmd.extend(["--port", str(port)])
     proc = subprocess.Popen(
-        [trigr_bin, "serve", "-f"],
+        cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -100,24 +102,32 @@ def _start_detached() -> int:
     return proc.pid
 
 
-def _is_server_running() -> bool:
+def _is_server_running(port: int | None = None) -> bool:
     """Check if server is reachable."""
     try:
-        resp = httpx.get(f"{_server_url()}/status", timeout=2)
+        resp = httpx.get(f"{_server_url(port)}/status", timeout=2)
         return resp.status_code == 200
     except (httpx.ConnectError, httpx.TimeoutException):
         return False
 
 
-def _ensure_server_running() -> None:
+def _ensure_config() -> None:
+    """Create trigr.toml with defaults if it doesn't exist."""
+    path = _config_path()
+    if not path.exists():
+        path.write_text(DEFAULT_CONFIG)
+
+
+def _ensure_server_running(port: int | None = None) -> None:
     """Auto-start server if not running, wait up to 3s."""
-    if _is_server_running():
+    _ensure_config()
+    if _is_server_running(port):
         return
-    pid = _start_detached()
+    pid = _start_detached(port)
     console.print(f"Started trigr server (PID {pid})", style="dim")
     for _ in range(30):
         time.sleep(0.1)
-        if _is_server_running():
+        if _is_server_running(port):
             return
     console.print("Warning: server may not have started in time.", style="yellow")
 
@@ -136,25 +146,27 @@ def init_cmd() -> None:
 @app.command()
 def serve(
     foreground: bool = typer.Option(False, "-f", "--foreground", help="Run in foreground"),
+    port: int | None = typer.Option(None, "--port", "-p", help="Port to listen on"),
 ) -> None:
     """Start the trigr server."""
     if foreground:
         import uvicorn
         from trigr.config import load_config
         config = load_config()
+        resolved_port = port or config.server.port
         uvicorn.run(
             "trigr.server:app",
             host=config.server.host,
-            port=config.server.port,
+            port=resolved_port,
             log_level="info",
         )
     else:
-        pid = _start_detached()
+        _ensure_config()
+        pid = _start_detached(port)
         console.print(f"trigr server started (PID {pid})", style="green")
-        # Wait briefly to confirm it started
         time.sleep(0.5)
-        if _is_server_running():
-            console.print(f"Listening on {_server_url()}", style="dim")
+        if _is_server_running(port):
+            console.print(f"Listening on {_server_url(port)}", style="dim")
         else:
             console.print("Warning: server may not have started yet.", style="yellow")
 
@@ -162,20 +174,20 @@ def serve(
 @app.command()
 def watch(
     timeout: int = typer.Option(300, "--timeout", "-t", help="Timeout in seconds"),
+    port: int | None = typer.Option(None, "--port", "-p", help="Server port"),
 ) -> None:
-    """Block until an event arrives, print it as JSON, then exit."""
-    _ensure_server_running()
+    """Block until a message arrives, print it, then exit."""
+    _ensure_server_running(port)
     try:
         resp = httpx.get(
-            f"{_server_url()}/next",
+            f"{_server_url(port)}/next",
             params={"timeout": timeout},
             timeout=timeout + 5,
         )
         data = resp.json()
         if data.get("status") == "timeout":
-            typer.echo(json.dumps({"status": "timeout"}))
             raise typer.Exit(1)
-        typer.echo(json.dumps(data))
+        typer.echo(data["message"])
     except httpx.ConnectError:
         console.print("Could not connect to trigr server.", style="red")
         raise typer.Exit(1)
@@ -183,27 +195,21 @@ def watch(
 
 @app.command()
 def emit(
-    event_type: str = typer.Argument(..., metavar="TYPE", help="Event type"),
-    data: str = typer.Option("{}", "--data", "-d", help="JSON data payload"),
-    source: str = typer.Option("", "--source", "-s", help="Event source"),
+    message: str = typer.Argument(..., help="Message to send to the agent"),
     delay: str | None = typer.Option(None, "--delay", help="Delay before delivery (e.g. 10s, 5m, 2h)"),
+    port: int | None = typer.Option(None, "--port", "-p", help="Server port"),
 ) -> None:
-    """Emit an event to the server."""
-    _ensure_server_running()
-    try:
-        payload_data = json.loads(data)
-    except json.JSONDecodeError as e:
-        console.print(f"Invalid JSON data: {e}", style="red")
-        raise typer.Exit(1)
+    """Send a message to the agent."""
+    _ensure_server_running(port)
 
-    payload: dict = {"type": event_type, "data": payload_data, "source": source}
+    payload: dict = {"message": message}
     if delay:
         payload["fire_at"] = _parse_delay(delay).isoformat()
 
     try:
-        resp = httpx.post(f"{_server_url()}/emit", json=payload, timeout=5)
+        resp = httpx.post(f"{_server_url(port)}/emit", json=payload, timeout=5)
         if resp.status_code == 200:
-            console.print(f"Emitted: {event_type}", style="green")
+            console.print("Emitted", style="green")
         else:
             console.print(f"Server error: {resp.status_code}", style="red")
             raise typer.Exit(1)
@@ -215,7 +221,8 @@ def emit(
 @app.command(name="add")
 def add_cmd(
     name: str = typer.Argument(..., help="Name for the poller/cron"),
-    command: str = typer.Option(..., "--command", "-c", help="Command to run"),
+    command: str | None = typer.Option(None, "--command", "-c", help="Command to run (stdout becomes the message)"),
+    message: str | None = typer.Option(None, "--message", "-m", help="Static message to deliver"),
     interval: int | None = typer.Option(None, "--interval", "-i", help="Interval in seconds (poller)"),
     cron: str | None = typer.Option(None, "--cron", help="Cron expression (5-field)"),
 ) -> None:
@@ -226,6 +233,18 @@ def add_cmd(
     if interval and cron:
         console.print("Provide only one of --interval or --cron.", style="red")
         raise typer.Exit(1)
+    if not command and not message:
+        console.print("Provide either --command or --message (or both).", style="red")
+        raise typer.Exit(1)
+
+    # Build command: message first, then command output
+    parts = []
+    if message:
+        escaped = message.replace("'", "'\\''")
+        parts.append(f"echo '{escaped}'")
+    if command:
+        parts.append(command)
+    resolved_command = " && ".join(parts)
 
     path = _config_path()
     if not path.exists():
@@ -240,14 +259,14 @@ def add_cmd(
         if name in pollers:
             console.print(f"Poller '{name}' already exists.", style="red")
             raise typer.Exit(1)
-        pollers[name] = {"interval": interval, "command": command}
+        pollers[name] = {"interval": interval, "command": resolved_command}
         label = f"poller '{name}' (every {interval}s)"
     else:
         crons = data.setdefault("crons", {})
         if name in crons:
             console.print(f"Cron '{name}' already exists.", style="red")
             raise typer.Exit(1)
-        crons[name] = {"cron": cron, "command": command}
+        crons[name] = {"cron": cron, "command": resolved_command}
         label = f"cron '{name}' ({cron})"
 
     path.write_bytes(tomli_w.dumps(data).encode())
@@ -255,11 +274,13 @@ def add_cmd(
 
 
 @app.command()
-def status() -> None:
+def status(
+    port: int | None = typer.Option(None, "--port", "-p", help="Server port"),
+) -> None:
     """Show server status."""
-    _ensure_server_running()
+    _ensure_server_running(port)
     try:
-        resp = httpx.get(f"{_server_url()}/status", timeout=5)
+        resp = httpx.get(f"{_server_url(port)}/status", timeout=5)
         data = resp.json()
         console.print(f"Status: [green]{data['status']}[/green]")
         console.print(f"Queue depth: {data['queue_depth']}")

@@ -69,36 +69,27 @@ class TestTrigrConfig:
 
 class TestEvent:
     def test_defaults(self) -> None:
-        e = Event(type="test")
-        assert e.type == "test"
-        assert e.source == ""
-        assert e.data == {}
+        e = Event(message="hello")
+        assert e.message == "hello"
         assert isinstance(e.timestamp, datetime)
 
     def test_custom_timestamp(self) -> None:
         ts = datetime(2025, 1, 1, 12, 0)
-        e = Event(type="test", timestamp=ts)
+        e = Event(message="hello", timestamp=ts)
         assert e.timestamp == ts
-
-    def test_with_data(self) -> None:
-        e = Event(type="test", source="poller", data={"key": "val"})
-        assert e.source == "poller"
-        assert e.data["key"] == "val"
 
 
 class TestEmitRequest:
     def test_minimal(self) -> None:
-        r = EmitRequest(type="ping")
-        assert r.type == "ping"
-        assert r.data == {}
-        assert r.source == ""
+        r = EmitRequest(message="ping")
+        assert r.message == "ping"
         assert r.fire_at is None
 
     def test_with_fire_at(self) -> None:
         ts = datetime(2025, 6, 1, 12, 0)
-        r = EmitRequest(type="ping", fire_at=ts)
+        r = EmitRequest(message="ping", fire_at=ts)
         assert r.fire_at == ts
 
-    def test_missing_type(self) -> None:
+    def test_missing_message(self) -> None:
         with pytest.raises(ValidationError):
             EmitRequest()  # type: ignore[call-arg]

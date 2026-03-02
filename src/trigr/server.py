@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import subprocess
 from contextlib import asynccontextmanager
@@ -59,17 +58,8 @@ def _run_poller_command(name: str, command: str) -> None:
         stdout = result.stdout.strip()
         if not stdout:
             return
-        try:
-            data = json.loads(stdout)
-        except json.JSONDecodeError:
-            data = {"raw": stdout}
 
-        event = Event(
-            type=data.get("type", f"poller.{name}"),
-            source=f"poller.{name}",
-            data=data,
-        )
-        # Schedule coroutine on the event loop
+        event = Event(message=stdout)
         loop = asyncio.get_event_loop()
         loop.call_soon_threadsafe(
             lambda e=event: _queue.put_nowait((e.timestamp, _next_seq(), e)),
@@ -121,13 +111,9 @@ app = FastAPI(title="trigr", lifespan=lifespan)
 
 @app.post("/emit")
 async def emit(req: EmitRequest) -> dict:
-    event = Event(
-        type=req.type,
-        source=req.source,
-        data=req.data,
-    )
+    event = Event(message=req.message)
     await enqueue(event, fire_at=req.fire_at)
-    return {"status": "queued", "type": req.type}
+    return {"status": "queued"}
 
 
 @app.get("/next")

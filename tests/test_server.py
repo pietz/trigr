@@ -16,15 +16,14 @@ async def client():
 
 @pytest.mark.asyncio
 async def test_emit_then_next(client: AsyncClient) -> None:
-    resp = await client.post("/emit", json={"type": "test", "data": {"msg": "hello"}})
+    resp = await client.post("/emit", json={"message": "hello world"})
     assert resp.status_code == 200
     assert resp.json()["status"] == "queued"
 
     resp = await client.get("/next", params={"timeout": 5})
     assert resp.status_code == 200
     body = resp.json()
-    assert body["type"] == "test"
-    assert body["data"]["msg"] == "hello"
+    assert body["message"] == "hello world"
 
 
 @pytest.mark.asyncio
@@ -37,9 +36,8 @@ async def test_next_timeout(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_delayed_event_not_returned_early(client: AsyncClient) -> None:
     fire_at = (datetime.now() + timedelta(seconds=3)).isoformat()
-    await client.post("/emit", json={"type": "delayed", "fire_at": fire_at})
+    await client.post("/emit", json={"message": "delayed", "fire_at": fire_at})
 
-    # With a 1s timeout, the delayed event should not be returned
     resp = await client.get("/next", params={"timeout": 1})
     assert resp.json()["status"] == "timeout"
 
@@ -47,12 +45,11 @@ async def test_delayed_event_not_returned_early(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_delayed_event_returned_after_fire_at(client: AsyncClient) -> None:
     fire_at = (datetime.now() + timedelta(seconds=1)).isoformat()
-    await client.post("/emit", json={"type": "delayed", "data": {"v": 1}, "fire_at": fire_at})
+    await client.post("/emit", json={"message": "future msg", "fire_at": fire_at})
 
     resp = await client.get("/next", params={"timeout": 5})
     body = resp.json()
-    assert body["type"] == "delayed"
-    assert body["data"]["v"] == 1
+    assert body["message"] == "future msg"
 
 
 @pytest.mark.asyncio
@@ -65,10 +62,3 @@ async def test_status(client: AsyncClient) -> None:
     assert "pollers" in body
     assert "crons" in body
     assert "jobs" in body
-
-
-@pytest.mark.asyncio
-async def test_emit_with_source(client: AsyncClient) -> None:
-    await client.post("/emit", json={"type": "src_test", "source": "my-agent"})
-    resp = await client.get("/next", params={"timeout": 5})
-    assert resp.json()["source"] == "my-agent"
