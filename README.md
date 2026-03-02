@@ -1,8 +1,10 @@
 # trigr
 
-AI CLI coding agents (Claude Code, Codex, Gemini CLI) are reactive — they only work when a human types a message. They have no native event system, no triggers, no way to react to external events autonomously.
+**Make any AI coding agent autonomous.**
 
-**trigr** fixes that. It's a lightweight event system that delivers events *into* a running agent session. The agent calls `trigr watch`, goes to sleep, and wakes up when something happens.
+AI coding agents like Claude Code are reactive — they only work when a human types a message. Frameworks like OpenClaw solve this with a full platform, but sometimes you just want to add events to the agent you already use.
+
+**trigr** is a lightweight event system that delivers events *into* a running agent session. The agent calls `trigr watch`, goes to sleep, and wakes up when something happens.
 
 ```
 Agent runs trigr watch (background task or blocking)
@@ -13,7 +15,7 @@ Agent runs trigr watch (background task or blocking)
     → "asleep" until next event
 ```
 
-One tool. One pattern. Works with any agent.
+One tool. One pattern. Works with Claude Code, Codex, and Gemini CLI.
 
 ## Install
 

@@ -1,6 +1,6 @@
 [project]
 name = "trigr"
-version = "1.0.1"
+version = "1.0.2"
 description = "Event system for AI CLI agents"
 readme = "README.md"
 license = "MIT"
