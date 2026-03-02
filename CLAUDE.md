@@ -1,53 +1,44 @@
 # trigr
 
-Lightweight CLI that compiles task specs (TOML) into native macOS `launchd` plists. No daemon — launchd *is* the scheduler.
+Event system for AI CLI agents. A FastAPI server with an in-memory priority queue that delivers events into running agent sessions via long-polling.
 
 ## Architecture
 
 ```
-TOML task → trigr add → launchd plist → launchd fires → trigr run → execute → log + notify
+trigr.toml → trigr serve → FastAPI + APScheduler
+                              ├── POST /emit    (push events)
+                              ├── GET  /next    (long-poll, blocks until event)
+                              └── GET  /status  (server info)
+
+Agent workflow:
+  trigr watch  ──→  GET /next  ──→  blocks  ──→  prints JSON  ──→  exits
+  trigr emit   ──→  POST /emit ──→  queued  ──→  delivered to next watcher
 ```
 
-## Key Paths
+## Key Files
 
-- Config: `~/.config/trigr/`
-- Tasks: `~/.config/trigr/tasks/*.toml`
-- Logs: `~/.config/trigr/logs/`
-- DB: `~/.config/trigr/history.db`
-- Plists: `~/Library/LaunchAgents/com.trigr.*.plist`
+- `src/trigr/models.py` — Pydantic models: ServerConfig, PollerConfig, CronConfig, TrigrConfig, Event, EmitRequest
+- `src/trigr/config.py` — TOML loading, find_config(), server_url()
+- `src/trigr/server.py` — FastAPI app, priority queue, APScheduler integration
+- `src/trigr/cli.py` — Typer CLI: init, serve, watch, emit, add, status
+- `trigr.toml` — project-local config (server settings, pollers, crons)
+- `.trigr.pid` — PID file for detached server (project-local)
 
 ## Commands
 
-- `trigr init` — create dirs, capture env
-- `trigr add <file.toml>` — register + load
-- `trigr remove <name>` — unload + delete
-- `trigr enable/disable <name>` — load/unload in launchd
-- `trigr list [--json]` — show all tasks
-- `trigr show <name> [--json]` — show config
-- `trigr logs [name] [-n 20] [--json]` — run history
-- `trigr run <name>` — execute immediately
-- `trigr edit <name>` — edit in $EDITOR
-- `trigr refresh` — re-capture env, regenerate all plists
-- `trigr output <name> [--json] [--stderr]` — show last run's output
-- `trigr validate <file.toml>` — check TOML without adding
-- `trigr status [--json]` — show currently-running tasks
-- `trigr clean [--older-than 30]` — purge old run data
-- `trigr create <name> --trigger ... --command/--prompt ...` — create task inline
-
-## Action Types
-
-Actions are inferred from fields — no `type` field needed:
-- **Script**: set `command` — runs as shell command
-- **LLM**: set `prompt` — runs via an LLM provider CLI
-
-LLM actions support `provider` (claude/codex/gemini, default: claude) and optional `model` override.
+- `trigr init` — create trigr.toml in cwd
+- `trigr serve [-f]` — start server (detached by default, -f for foreground)
+- `trigr watch [--timeout 300]` — long-poll for next event, print JSON, exit
+- `trigr emit <type> [--data '{}'] [--delay 48h]` — push event to queue
+- `trigr add <name> --command "..." (--interval N | --cron "...")` — add poller/cron to trigr.toml
+- `trigr status` — show server state
 
 ## Dev
 
 ```bash
 uv sync
 uv run python -m pytest  # not `uv run pytest`
-uv tool install --reinstall .  # installs `trigr` globally (--reinstall to bust cache)
+uv tool install --reinstall .  # install trigr globally
 ```
 
 ## Publishing
@@ -61,10 +52,8 @@ PyPI token is in `.env` (gitignored).
 
 ## Notes
 
-- Uses `plistlib` (stdlib) for plist generation
-- `fcntl.flock` for run locking (skip if already running)
-- SQLite for run history, osascript for notifications
-- Env captured at `trigr init` time and baked into plists
-- Task-level env vars via `[action.env]` in TOML
-- Consecutive failure tracking: `notify.max_consecutive_failures` auto-disables tasks
-- `trigr refresh` after PATH changes or `uv tool upgrade trigr`
+- Priority queue sorts by (fire_at, sequence_number) for FIFO within same timestamp
+- Pollers run commands via subprocess in executor threads, parse stdout as JSON
+- Server auto-starts when using `trigr watch` or `trigr emit`
+- PID file is project-local (.trigr.pid), supporting multiple servers on different ports
+- Default port: 9374

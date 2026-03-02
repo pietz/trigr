@@ -1,34 +1,42 @@
-import fcntl
 import json
 import os
-import shutil
+import re
+import signal
 import subprocess
-import tempfile
-from datetime import datetime
+import sys
+import time
+from datetime import datetime, timedelta
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 
+import httpx
 import tomli_w
 import tomllib
 import typer
 from rich.console import Console
-from rich.table import Table
 
-from trigr.config import LOCKS_DIR, LOGS_DIR, TASKS_DIR, ensure_init, init
-from trigr.models import ActionConfig, CronSchedule, NotifyConfig, TaskConfig, TriggerConfig, TriggerType
-from trigr.plist import is_loaded, load_plist, plist_path, remove_plist, unload_plist, write_plist
-from trigr.runner import run_task
-from trigr.store import delete_old_runs, get_last_output, get_runs
+app = typer.Typer(help="Event system for AI CLI agents.", no_args_is_help=True)
+console = Console()
+
+DEFAULT_CONFIG = """\
+[server]
+host = "127.0.0.1"
+port = 9374
+
+# [pollers.example]
+# interval = 60
+# command = "echo '{\\"type\\": \\"tick\\"}'"
+
+# [crons.example]
+# cron = "0 9 * * *"
+# command = "echo '{\\"type\\": \\"morning\\"}'"
+"""
 
 
 def _version_callback(value: bool) -> None:
     if value:
         typer.echo(f"trigr {pkg_version('trigr')}")
         raise typer.Exit()
-
-
-app = typer.Typer(help="Compile task specs into launchd schedules.", no_args_is_help=True)
-console = Console()
 
 
 @app.callback()
@@ -38,593 +46,233 @@ def _main(
         callback=_version_callback, is_eager=True,
     ),
 ) -> None:
-    """trigr — lightweight launchd task scheduler."""
+    """trigr — event system for AI CLI agents."""
 
 
-def _load_task_from_file(path: Path) -> TaskConfig:
-    """Load and validate a task config from a TOML file."""
+def _config_path() -> Path:
+    return Path.cwd() / "trigr.toml"
+
+
+def _pid_path() -> Path:
+    return Path.cwd() / ".trigr.pid"
+
+
+def _load_toml() -> dict:
+    path = _config_path()
+    if not path.exists():
+        return {}
     with open(path, "rb") as f:
-        data = tomllib.load(f)
-    return TaskConfig(**data)
+        return tomllib.load(f)
 
 
-def _all_tasks() -> tuple[list[TaskConfig], list[tuple[Path, str]]]:
-    """Load all task configs from the tasks directory."""
-    tasks: list[TaskConfig] = []
-    invalid_tasks: list[tuple[Path, str]] = []
-    for toml_file in sorted(TASKS_DIR.glob("*.toml")):
-        try:
-            tasks.append(_load_task_from_file(toml_file))
-        except Exception as exc:
-            invalid_tasks.append((toml_file, str(exc)))
-    return tasks, invalid_tasks
+def _server_url() -> str:
+    data = _load_toml()
+    server = data.get("server", {})
+    host = server.get("host", "127.0.0.1")
+    port = server.get("port", 9374)
+    return f"http://{host}:{port}"
+
+
+def _parse_delay(delay: str) -> datetime:
+    """Convert '48h', '30m', '5s' to absolute datetime."""
+    match = re.fullmatch(r"(\d+)([smhd])", delay.strip())
+    if not match:
+        raise typer.BadParameter(f"Invalid delay format: {delay!r} (use e.g. 10s, 5m, 2h, 1d)")
+    value = int(match.group(1))
+    unit = match.group(2)
+    delta = {"s": timedelta(seconds=value), "m": timedelta(minutes=value),
+             "h": timedelta(hours=value), "d": timedelta(days=value)}[unit]
+    return datetime.now() + delta
+
+
+def _start_detached() -> int:
+    """Spawn 'trigr serve -f' as a background process. Returns PID."""
+    # Find the trigr executable
+    trigr_bin = sys.argv[0] if os.path.isfile(sys.argv[0]) else "trigr"
+    proc = subprocess.Popen(
+        [trigr_bin, "serve", "-f"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        cwd=Path.cwd(),
+    )
+    _pid_path().write_text(str(proc.pid))
+    return proc.pid
+
+
+def _is_server_running() -> bool:
+    """Check if server is reachable."""
+    try:
+        resp = httpx.get(f"{_server_url()}/status", timeout=2)
+        return resp.status_code == 200
+    except (httpx.ConnectError, httpx.TimeoutException):
+        return False
+
+
+def _ensure_server_running() -> None:
+    """Auto-start server if not running, wait up to 3s."""
+    if _is_server_running():
+        return
+    pid = _start_detached()
+    console.print(f"Started trigr server (PID {pid})", style="dim")
+    for _ in range(30):
+        time.sleep(0.1)
+        if _is_server_running():
+            return
+    console.print("Warning: server may not have started in time.", style="yellow")
 
 
 @app.command(name="init")
 def init_cmd() -> None:
-    """Initialize trigr: create dirs, capture env, init database."""
-    init()
-    console.print("Initialized trigr.", style="green")
+    """Create trigr.toml in the current directory."""
+    path = _config_path()
+    if path.exists():
+        console.print("trigr.toml already exists.", style="red")
+        raise typer.Exit(1)
+    path.write_text(DEFAULT_CONFIG)
+    console.print("Created trigr.toml", style="green")
 
 
 @app.command()
-def add(file: Path) -> None:
-    """Register a task from a TOML file, generate plist, and load into launchd."""
-    ensure_init()
-    if not file.exists():
-        console.print(f"File not found: {file}", style="red")
-        raise typer.Exit(1)
-
-    task = _load_task_from_file(file)
-
-    # Copy TOML to tasks dir
-    dest = TASKS_DIR / f"{task.name}.toml"
-    if dest.exists():
-        console.print(f"Task '{task.name}' already exists. Use 'trigr remove' first.", style="red")
-        raise typer.Exit(1)
-
-    shutil.copy2(file, dest)
-
-    # Generate and write plist
-    plist_file = write_plist(task)
-
-    # Load into launchd if enabled
-    if task.enabled:
-        if load_plist(task.name):
-            console.print(f"Added and loaded task '{task.name}'.", style="green")
+def serve(
+    foreground: bool = typer.Option(False, "-f", "--foreground", help="Run in foreground"),
+) -> None:
+    """Start the trigr server."""
+    if foreground:
+        import uvicorn
+        from trigr.config import load_config
+        config = load_config()
+        uvicorn.run(
+            "trigr.server:app",
+            host=config.server.host,
+            port=config.server.port,
+            log_level="info",
+        )
+    else:
+        pid = _start_detached()
+        console.print(f"trigr server started (PID {pid})", style="green")
+        # Wait briefly to confirm it started
+        time.sleep(0.5)
+        if _is_server_running():
+            console.print(f"Listening on {_server_url()}", style="dim")
         else:
-            console.print(
-                f"Added task '{task.name}', but failed to load it into launchd.",
-                style="red",
-            )
-            console.print("Run `trigr enable <name>` after fixing launchd errors.", style="yellow")
-            console.print(f"  TOML: {dest}")
-            console.print(f"  Plist: {plist_file}")
+            console.print("Warning: server may not have started yet.", style="yellow")
+
+
+@app.command()
+def watch(
+    timeout: int = typer.Option(300, "--timeout", "-t", help="Timeout in seconds"),
+) -> None:
+    """Block until an event arrives, print it as JSON, then exit."""
+    _ensure_server_running()
+    try:
+        resp = httpx.get(
+            f"{_server_url()}/next",
+            params={"timeout": timeout},
+            timeout=timeout + 5,
+        )
+        data = resp.json()
+        if data.get("status") == "timeout":
+            typer.echo(json.dumps({"status": "timeout"}))
             raise typer.Exit(1)
-    else:
-        console.print(f"Added task '{task.name}' (disabled).", style="yellow")
-
-    console.print(f"  TOML: {dest}")
-    console.print(f"  Plist: {plist_file}")
-
-
-@app.command()
-def remove(name: str) -> None:
-    """Unload and remove a task (plist + task file)."""
-    ensure_init()
-    task_file = TASKS_DIR / f"{name}.toml"
-
-    if not task_file.exists():
-        console.print(f"Task '{name}' not found.", style="red")
-        raise typer.Exit(1)
-
-    # Unload from launchd
-    unload_plist(name)
-    remove_plist(name)
-    task_file.unlink()
-    console.print(f"Removed task '{name}'.", style="green")
-
-
-@app.command()
-def enable(name: str) -> None:
-    """Load a task into launchd."""
-    ensure_init()
-    task_file = TASKS_DIR / f"{name}.toml"
-    if not task_file.exists():
-        console.print(f"Task '{name}' not found.", style="red")
-        raise typer.Exit(1)
-
-    # Regenerate plist in case it's missing
-    task = _load_task_from_file(task_file)
-    write_plist(task)
-
-    if load_plist(name):
-        console.print(f"Enabled task '{name}'.", style="green")
-    else:
-        console.print(f"Failed to enable task '{name}'.", style="red")
+        typer.echo(json.dumps(data))
+    except httpx.ConnectError:
+        console.print("Could not connect to trigr server.", style="red")
         raise typer.Exit(1)
 
 
 @app.command()
-def disable(name: str) -> None:
-    """Unload a task from launchd."""
-    ensure_init()
-    if unload_plist(name):
-        console.print(f"Disabled task '{name}'.", style="green")
-    else:
-        console.print(f"Failed to disable task '{name}'.", style="red")
-        raise typer.Exit(1)
-
-
-@app.command(name="list")
-def list_cmd(
-    as_json: bool = typer.Option(False, "--json", help="Output as JSON"),
+def emit(
+    event_type: str = typer.Argument(..., metavar="TYPE", help="Event type"),
+    data: str = typer.Option("{}", "--data", "-d", help="JSON data payload"),
+    source: str = typer.Option("", "--source", "-s", help="Event source"),
+    delay: str | None = typer.Option(None, "--delay", help="Delay before delivery (e.g. 10s, 5m, 2h)"),
 ) -> None:
-    """List all tasks with status and last run info."""
-    ensure_init()
-    tasks, invalid_tasks = _all_tasks()
+    """Emit an event to the server."""
+    _ensure_server_running()
+    try:
+        payload_data = json.loads(data)
+    except json.JSONDecodeError as e:
+        console.print(f"Invalid JSON data: {e}", style="red")
+        raise typer.Exit(1)
 
-    for invalid_file, error in invalid_tasks:
-        typer.echo(
-            f"Warning: skipping invalid task file '{invalid_file.name}': {error}",
-            err=True,
-        )
+    payload: dict = {"type": event_type, "data": payload_data, "source": source}
+    if delay:
+        payload["fire_at"] = _parse_delay(delay).isoformat()
 
-    if as_json:
-        output = []
-        for task in tasks:
-            runs = get_runs(task.name, limit=1)
-            last_run = runs[0] if runs else None
-            output.append({
-                "name": task.name,
-                "description": task.description,
-                "trigger": task.trigger.type.value,
-                "action": (task.action.provider or "claude") if task.action.prompt else "script",
-                "enabled": task.enabled,
-                "loaded": is_loaded(task.name),
-                "last_run": last_run,
-            })
-        typer.echo(json.dumps(output, indent=2))
-        return
-
-    if not tasks:
-        console.print("No tasks registered.", style="yellow")
-        return
-
-    table = Table(title="Scheduled Tasks")
-    table.add_column("Name", style="cyan")
-    table.add_column("Trigger")
-    table.add_column("Action")
-    table.add_column("Status")
-    table.add_column("Last Run")
-
-    for task in tasks:
-        loaded = is_loaded(task.name)
-        status = "[green]loaded[/green]" if loaded else "[yellow]unloaded[/yellow]"
-
-        runs = get_runs(task.name, limit=1)
-        if runs:
-            last = runs[0]
-            code = last["exit_code"]
-            color = "green" if code == 0 else "red"
-            last_run = f"[{color}]exit {code}[/{color}] @ {last['finished_at'][:19]}"
+    try:
+        resp = httpx.post(f"{_server_url()}/emit", json=payload, timeout=5)
+        if resp.status_code == 200:
+            console.print(f"Emitted: {event_type}", style="green")
         else:
-            last_run = "[dim]never[/dim]"
-
-        action_label = (task.action.provider or "claude") if task.action.prompt else "script"
-        table.add_row(
-            task.name,
-            task.trigger.type.value,
-            action_label,
-            status,
-            last_run,
-        )
-
-    console.print(table)
+            console.print(f"Server error: {resp.status_code}", style="red")
+            raise typer.Exit(1)
+    except httpx.ConnectError:
+        console.print("Could not connect to trigr server.", style="red")
+        raise typer.Exit(1)
 
 
-@app.command()
-def show(
-    name: str,
-    as_json: bool = typer.Option(False, "--json", help="Output as JSON"),
+@app.command(name="add")
+def add_cmd(
+    name: str = typer.Argument(..., help="Name for the poller/cron"),
+    command: str = typer.Option(..., "--command", "-c", help="Command to run"),
+    interval: int | None = typer.Option(None, "--interval", "-i", help="Interval in seconds (poller)"),
+    cron: str | None = typer.Option(None, "--cron", help="Cron expression (5-field)"),
 ) -> None:
-    """Show full task configuration."""
-    ensure_init()
-    task_file = TASKS_DIR / f"{name}.toml"
-    if not task_file.exists():
-        console.print(f"Task '{name}' not found.", style="red")
+    """Add a poller or cron job to trigr.toml."""
+    if not interval and not cron:
+        console.print("Provide either --interval or --cron.", style="red")
+        raise typer.Exit(1)
+    if interval and cron:
+        console.print("Provide only one of --interval or --cron.", style="red")
         raise typer.Exit(1)
 
-    task = _load_task_from_file(task_file)
-
-    if as_json:
-        typer.echo(task.model_dump_json(indent=2))
-        return
-
-    console.print(f"[bold cyan]{task.name}[/bold cyan]")
-    if task.description:
-        console.print(f"  {task.description}")
-    console.print(f"  Trigger: {task.trigger.type.value}")
-    action_label = (task.action.provider or "claude") if task.action.prompt else "script"
-    console.print(f"  Action:  {action_label}")
-    console.print(f"  Timeout: {task.action.timeout}s")
-    console.print(f"  Loaded:  {is_loaded(name)}")
-    console.print(f"  Plist:   {plist_path(name)}")
-    console.print(f"  TOML:    {task_file}")
-
-
-@app.command()
-def logs(
-    name: str | None = typer.Argument(None, help="Task name (all tasks if omitted)"),
-    n: int = typer.Option(20, "-n", help="Number of entries"),
-    as_json: bool = typer.Option(False, "--json", help="Output as JSON"),
-) -> None:
-    """Show run history from SQLite."""
-    ensure_init()
-    runs = get_runs(name, limit=n)
-
-    if as_json:
-        typer.echo(json.dumps(runs, indent=2))
-        return
-
-    if not runs:
-        console.print("No runs recorded.", style="yellow")
-        return
-
-    table = Table(title="Run History")
-    table.add_column("ID", style="dim")
-    table.add_column("Task", style="cyan")
-    table.add_column("Started")
-    table.add_column("Duration")
-    table.add_column("Exit")
-
-    for run in runs:
-        code = run["exit_code"]
-        exit_style = "green" if code == 0 else "red"
-
-        started = run["started_at"][:19]
-        # Compute duration
-        if run["finished_at"] and run["started_at"]:
-            from datetime import datetime
-            try:
-                s = datetime.fromisoformat(run["started_at"])
-                f = datetime.fromisoformat(run["finished_at"])
-                dur = f"{(f - s).total_seconds():.1f}s"
-            except Exception:
-                dur = "?"
-        else:
-            dur = "?"
-
-        table.add_row(
-            str(run["id"]),
-            run["task_name"],
-            started,
-            dur,
-            f"[{exit_style}]{code}[/{exit_style}]",
-        )
-
-    console.print(table)
-
-
-@app.command()
-def run(name: str) -> None:
-    """Execute a task immediately (runner entrypoint for launchd)."""
-    ensure_init()
-    exit_code = run_task(name)
-    raise typer.Exit(exit_code)
-
-
-@app.command()
-def edit(name: str) -> None:
-    """Open task TOML in $EDITOR, re-validate and regenerate plist on save."""
-    ensure_init()
-    task_file = TASKS_DIR / f"{name}.toml"
-    if not task_file.exists():
-        console.print(f"Task '{name}' not found.", style="red")
+    path = _config_path()
+    if not path.exists():
+        console.print("No trigr.toml found. Run 'trigr init' first.", style="red")
         raise typer.Exit(1)
 
-    editor = os.environ.get("EDITOR", "nano")
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
 
-    # Copy to temp file for editing
-    content_before = task_file.read_text()
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as tmp:
-        tmp.write(content_before)
-        tmp_path = tmp.name
-
-    try:
-        subprocess.run([editor, tmp_path], check=True)
-        content_after = Path(tmp_path).read_text()
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
-
-    if content_after == content_before:
-        console.print("No changes made.", style="yellow")
-        return
-
-    # Validate new content
-    try:
-        import tomllib as tl
-        task = TaskConfig(**tl.loads(content_after))
-    except Exception as e:
-        console.print(f"Invalid config: {e}", style="red")
-        console.print("Changes discarded.", style="yellow")
-        raise typer.Exit(1)
-
-    # Save and regenerate
-    was_loaded = is_loaded(name)
-    if was_loaded:
-        unload_plist(name)
-
-    task_file.write_text(content_after)
-    write_plist(task)
-
-    if was_loaded:
-        load_plist(task.name)
-
-    console.print(f"Updated task '{name}'.", style="green")
-
-
-@app.command()
-def refresh() -> None:
-    """Re-capture env, regenerate and reload all plists."""
-    init()
-    tasks, invalid_tasks = _all_tasks()
-    for invalid_file, error in invalid_tasks:
-        console.print(
-            f"Skipping invalid task file '{invalid_file.name}': {error}",
-            style="yellow",
-        )
-    count = 0
-    for task in tasks:
-        was_loaded = is_loaded(task.name)
-        unload_plist(task.name)
-        write_plist(task)
-        if was_loaded:
-            load_plist(task.name)
-        count += 1
-    console.print(f"Refreshed {count} tasks.", style="green")
-
-
-@app.command()
-def output(
-    name: str,
-    as_json: bool = typer.Option(False, "--json", help="Output as JSON"),
-    show_stderr: bool = typer.Option(False, "--stderr", help="Show stderr instead of stdout"),
-) -> None:
-    """Show last run's output for a task."""
-    ensure_init()
-    result = get_last_output(name)
-    if result is None:
-        console.print("No runs recorded.", style="yellow")
-        raise typer.Exit(1)
-
-    if as_json:
-        typer.echo(json.dumps(result, indent=2))
-        return
-
-    text = result["stderr"] if show_stderr else result["stdout"]
-    if text:
-        typer.echo(text)
+    if interval:
+        pollers = data.setdefault("pollers", {})
+        if name in pollers:
+            console.print(f"Poller '{name}' already exists.", style="red")
+            raise typer.Exit(1)
+        pollers[name] = {"interval": interval, "command": command}
+        label = f"poller '{name}' (every {interval}s)"
     else:
-        console.print("(empty)", style="dim")
+        crons = data.setdefault("crons", {})
+        if name in crons:
+            console.print(f"Cron '{name}' already exists.", style="red")
+            raise typer.Exit(1)
+        crons[name] = {"cron": cron, "command": command}
+        label = f"cron '{name}' ({cron})"
+
+    path.write_bytes(tomli_w.dumps(data).encode())
+    console.print(f"Added {label}", style="green")
 
 
 @app.command()
-def validate(file: Path) -> None:
-    """Validate a TOML task file without registering it."""
-    if not file.exists():
-        console.print(f"File not found: {file}", style="red")
-        raise typer.Exit(1)
+def status() -> None:
+    """Show server status."""
+    _ensure_server_running()
     try:
-        task = _load_task_from_file(file)
-        console.print(f"Valid: task '{task.name}'", style="green")
-    except Exception as e:
-        console.print(f"Invalid: {e}", style="red")
+        resp = httpx.get(f"{_server_url()}/status", timeout=5)
+        data = resp.json()
+        console.print(f"Status: [green]{data['status']}[/green]")
+        console.print(f"Queue depth: {data['queue_depth']}")
+        console.print(f"Pollers: {data['pollers']}")
+        console.print(f"Crons: {data['crons']}")
+        if data.get("jobs"):
+            console.print("\nScheduled jobs:")
+            for job in data["jobs"]:
+                next_run = job.get("next_run") or "N/A"
+                console.print(f"  {job['name']} — next: {next_run}")
+    except httpx.ConnectError:
+        console.print("Could not connect to trigr server.", style="red")
         raise typer.Exit(1)
-
-
-@app.command()
-def status(
-    as_json: bool = typer.Option(False, "--json", help="Output as JSON"),
-) -> None:
-    """Show currently-running tasks by checking lock files."""
-    ensure_init()
-    running: list[dict] = []
-
-    for lock_file in LOCKS_DIR.glob("*.lock"):
-        task_name = lock_file.stem
-        try:
-            fd = open(lock_file)
-            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # Lock acquired = not running, release immediately
-            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-            fd.close()
-        except BlockingIOError:
-            mtime = datetime.fromtimestamp(lock_file.stat().st_mtime)
-            running.append({
-                "name": task_name,
-                "running_since": mtime.isoformat(),
-            })
-            fd.close()
-
-    if as_json:
-        typer.echo(json.dumps(running, indent=2))
-        return
-
-    if not running:
-        console.print("No tasks currently running.", style="dim")
-        return
-
-    table = Table(title="Running Tasks")
-    table.add_column("Task", style="cyan")
-    table.add_column("Running Since")
-    for r in running:
-        table.add_row(r["name"], r["running_since"][:19])
-    console.print(table)
-
-
-@app.command()
-def clean(
-    older_than: int = typer.Option(30, "--older-than", help="Delete runs older than N days"),
-) -> None:
-    """Purge old run data from the database and truncate log files."""
-    ensure_init()
-    deleted = delete_old_runs(older_than)
-
-    # Truncate old log files
-    cleaned = 0
-    if LOGS_DIR.exists():
-        cutoff = datetime.now().timestamp() - older_than * 86400
-        for log_file in LOGS_DIR.glob("*.log"):
-            if log_file.stat().st_mtime < cutoff:
-                log_file.write_text("")
-                cleaned += 1
-
-    console.print(f"Deleted {deleted} runs, cleaned {cleaned} log files.", style="green")
-
-
-@app.command()
-def create(
-    name: str,
-    # Trigger options
-    trigger: TriggerType = typer.Option(..., help="Trigger type"),
-    hour: int | None = typer.Option(None, help="Cron hour (0-23)"),
-    minute: int | None = typer.Option(None, help="Cron minute (0-59)"),
-    day: int | None = typer.Option(None, help="Cron day of month (1-31)"),
-    weekday: int | None = typer.Option(None, help="Cron weekday (0=Sun)"),
-    month: int | None = typer.Option(None, help="Cron month (1-12)"),
-    interval_seconds: int | None = typer.Option(None, "--interval-seconds", help="Interval in seconds"),
-    watch_paths: list[str] | None = typer.Option(None, "--watch-path", help="Paths to watch"),
-    # Action options
-    command: str | None = typer.Option(None, help="Script command"),
-    prompt: str | None = typer.Option(None, help="LLM prompt"),
-    provider: str | None = typer.Option(None, help="LLM provider: claude, codex, or gemini"),
-    model: str | None = typer.Option(None, help="Override default model for provider"),
-    working_dir: str | None = typer.Option(None, "--working-dir", help="Working directory"),
-    timeout: int = typer.Option(300, help="Timeout in seconds"),
-    # Notify options
-    notify_on_success: bool = typer.Option(False, "--notify-on-success", help="Notify on success"),
-    notify_on_failure: bool = typer.Option(True, "--notify-on-failure", help="Notify on failure"),
-    notify_title: str | None = typer.Option(None, "--notify-title", help="Custom notification title"),
-    max_consecutive_failures: int = typer.Option(0, "--max-failures", help="Auto-disable after N failures (0=never)"),
-    # Task options
-    description: str = typer.Option("", help="Task description"),
-) -> None:
-    """Create a task inline without writing a TOML file first."""
-    ensure_init()
-
-    # Build trigger config
-    trigger_type = trigger
-    cron_schedule = None
-    if trigger_type == TriggerType.cron:
-        cron_schedule = CronSchedule(
-            minute=minute, hour=hour, day=day, weekday=weekday, month=month,
-        )
-    trigger_config = TriggerConfig(
-        type=trigger_type,
-        cron=cron_schedule,
-        interval_seconds=interval_seconds,
-        watch_paths=watch_paths,
-    )
-
-    # Build action config
-    action_config = ActionConfig(
-        command=command,
-        prompt=prompt,
-        provider=provider,
-        model=model,
-        working_dir=working_dir,
-        timeout=timeout,
-    )
-
-    # Build notify config
-    notify_config = NotifyConfig(
-        on_success=notify_on_success,
-        on_failure=notify_on_failure,
-        title=notify_title,
-        max_consecutive_failures=max_consecutive_failures,
-    )
-
-    # Build and validate task
-    try:
-        task = TaskConfig(
-            name=name,
-            description=description,
-            trigger=trigger_config,
-            action=action_config,
-            notify=notify_config,
-        )
-    except Exception as e:
-        console.print(f"Invalid config: {e}", style="red")
-        raise typer.Exit(1)
-
-    # Write TOML
-    dest = TASKS_DIR / f"{name}.toml"
-    if dest.exists():
-        console.print(f"Task '{name}' already exists. Use 'trigr remove' first.", style="red")
-        raise typer.Exit(1)
-
-    # Serialize to TOML
-    data: dict = {"name": name}
-    if description:
-        data["description"] = description
-
-    trigger_data: dict = {"type": trigger_type.value}
-    if trigger_type == TriggerType.interval:
-        trigger_data["interval_seconds"] = interval_seconds
-    elif trigger_type == TriggerType.watch and watch_paths:
-        trigger_data["watch_paths"] = watch_paths
-    if trigger_type == TriggerType.cron and cron_schedule:
-        cron_data = {}
-        for field in ("minute", "hour", "day", "weekday", "month"):
-            val = getattr(cron_schedule, field)
-            if val is not None:
-                cron_data[field] = val
-        trigger_data["cron"] = cron_data
-    data["trigger"] = trigger_data
-
-    action_data: dict = {}
-    if command:
-        action_data["command"] = command
-    if prompt:
-        action_data["prompt"] = prompt
-    if provider:
-        action_data["provider"] = provider
-    if model:
-        action_data["model"] = model
-    if working_dir:
-        action_data["working_dir"] = working_dir
-    if timeout != 300:
-        action_data["timeout"] = timeout
-    data["action"] = action_data
-
-    notify_data: dict = {
-        "on_success": notify_on_success,
-        "on_failure": notify_on_failure,
-    }
-    if notify_title:
-        notify_data["title"] = notify_title
-    if max_consecutive_failures > 0:
-        notify_data["max_consecutive_failures"] = max_consecutive_failures
-    data["notify"] = notify_data
-
-    dest.write_bytes(tomli_w.dumps(data).encode())
-
-    # Generate plist and load
-    plist_file = write_plist(task)
-    if not load_plist(name):
-        console.print(
-            f"Created task '{name}', but failed to load it into launchd.",
-            style="red",
-        )
-        console.print("Run `trigr enable <name>` after fixing launchd errors.", style="yellow")
-        console.print(f"  TOML: {dest}")
-        console.print(f"  Plist: {plist_file}")
-        raise typer.Exit(1)
-
-    console.print(f"Created and loaded task '{name}'.", style="green")
-    console.print(f"  TOML: {dest}")
-    console.print(f"  Plist: {plist_file}")
 
 
 def main() -> None:

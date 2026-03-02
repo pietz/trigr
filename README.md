@@ -1,10 +1,10 @@
 # trigr
 
-Schedule LLM prompts on your Mac. Define a trigger and a prompt, and trigr handles the rest — using native `launchd` under the hood, no daemon required.
+Event system for AI CLI agents. Run `trigr watch` inside your agent session to receive events — from other terminals, scheduled pollers, or cron jobs.
 
-- Get a morning briefing every day at 8am
-- Summarize new files dropped into a folder
-- Run a shell command on a schedule and get notified if it fails
+- Deliver events *into* a running Claude Code / Codex / Gemini session
+- Schedule pollers (interval) and cron jobs that produce events
+- Simple long-polling: `trigr watch` blocks, prints JSON, exits
 
 ## Install
 
@@ -18,183 +18,99 @@ Or from PyPI:
 pipx install trigr
 ```
 
-You'll also need at least one LLM CLI installed: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), or [Gemini CLI](https://github.com/google-gemini/gemini-cli).
-
 ## Quick Start
 
 ```bash
-# Initialize trigr (creates config dirs, captures env)
+# Create config in your project
 trigr init
 
-# Morning briefing every day at 8am
-trigr create morning-briefing \
-  --trigger cron --hour 8 --minute 0 \
-  --prompt "Give me a concise morning briefing: weather in Berlin, top 3 tech news, and any interesting AI developments from the last 24h" \
-  --notify-on-success
+# Terminal 1: watch for events (auto-starts server)
+trigr watch
 
-# Describe any new file added to Downloads
-trigr create describe-downloads \
-  --trigger watch --watch-path ~/Downloads \
-  --prompt "A new file was just added to ~/Downloads. List what's new and briefly describe what each file is." \
-  --notify-on-success
-
-# Check your tasks
-trigr list
+# Terminal 2: emit an event
+trigr emit hello --data '{"msg": "world"}'
+# → Terminal 1 prints the event JSON and exits
 ```
 
-## Examples
+## Use with AI Agents
 
-### Morning Briefing
+The key insight: `trigr watch` is a blocking call that prints JSON and exits — perfect for background tasks in agent sessions.
 
-```toml
-name = "morning-briefing"
-description = "Daily summary to start the day"
+```bash
+# In Claude Code, run as a background task:
+trigr watch --timeout 3600
 
-[trigger]
-type = "cron"
-
-[trigger.cron]
-hour = 8
-minute = 0
-
-[action]
-prompt = "Give me a concise morning briefing: weather in Berlin, top 3 tech news, and any interesting AI developments from the last 24h"
-
-[notify]
-on_success = true
+# When an event arrives, the background task completes
+# and the agent receives the event data as a notification
 ```
 
-### Describe New Files
+From another terminal (or a script, webhook handler, etc.):
 
-```toml
-name = "describe-downloads"
-description = "Summarize new files in Downloads"
-
-[trigger]
-type = "watch"
-watch_paths = ["~/Downloads"]
-
-[action]
-prompt = "A new file was just added to ~/Downloads. List what's new and briefly describe what each file is."
-
-[notify]
-on_success = true
+```bash
+trigr emit code_review --data '{"pr": 42, "repo": "myapp"}'
 ```
 
-### Periodic Research
+## trigr.toml
+
+Project-local configuration file. Created by `trigr init`.
 
 ```toml
-name = "ai-paper-digest"
-description = "Weekly AI paper roundup"
+[server]
+host = "127.0.0.1"
+port = 9374
 
-[trigger]
-type = "cron"
+# Pollers run on an interval, stdout parsed as JSON → queued as event
+[pollers.check-inbox]
+interval = 300
+command = "python check_mail.py"
 
-[trigger.cron]
-hour = 18
-minute = 0
-weekday = 5  # Friday
-
-[action]
-prompt = "Find the 5 most interesting AI/ML papers published this week. For each, give the title, one-sentence summary, and why it matters."
-provider = "gemini"
-
-[notify]
-on_success = true
+# Cron jobs use 5-field cron expressions
+[crons.morning-sync]
+cron = "0 9 * * *"
+command = "echo '{\"type\": \"morning\", \"data\": {}}'"
 ```
 
-### Script with Failure Alerts
+### Poller Output Format
 
-trigr also supports plain shell commands for traditional automation:
+Poller commands should print JSON to stdout. If the JSON has a `type` field, it's used as the event type. Otherwise, the event type defaults to `poller.<name>`.
 
-```toml
-name = "health-check"
-description = "Ping endpoint every 5 minutes"
-
-[trigger]
-type = "interval"
-interval_seconds = 300
-
-[action]
-command = "curl -sf https://example.com/health || exit 1"
-
-[notify]
-on_failure = true
-max_consecutive_failures = 5  # auto-disable after 5 failures in a row
-```
-
-## Task Format
-
-Tasks are TOML files with three sections: **trigger**, **action**, and optionally **notify**.
-
-### Triggers
-
-| Type | Fields | Description |
-|------|--------|-------------|
-| `cron` | `minute`, `hour`, `day`, `weekday`, `month` | Calendar schedule (all fields optional) |
-| `interval` | `interval_seconds` | Run every N seconds |
-| `watch` | `watch_paths` | Run when files/directories change |
-
-Cron weekdays: 0 = Sunday, 6 = Saturday.
-
-### Actions
-
-Actions are inferred from which field you set — no `type` needed:
-
-- **`prompt`** — Send to an LLM provider CLI (default: `claude`)
-- **`command`** — Run as a shell command
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `prompt` | — | The prompt to send to the LLM |
-| `command` | — | Shell command to execute |
-| `provider` | `claude` | LLM provider: `claude`, `codex`, or `gemini` |
-| `model` | — | Override the provider's default model |
-| `timeout` | `300` | Kill after N seconds |
-| `working_dir` | — | Working directory |
-| `env` | — | Extra environment variables (table) |
-
-### Notifications
-
-trigr sends macOS notifications via `terminal-notifier` (preferred) or `osascript` (fallback). Click a notification to see the full output.
-
-```toml
-[notify]
-on_success = false      # default
-on_failure = true       # default
-title = "Custom Title"  # defaults to task name
-max_consecutive_failures = 5  # auto-disable after N failures (0 = never)
+```bash
+# Simple poller command
+echo '{"type": "new_email", "data": {"from": "alice@example.com", "subject": "Hello"}}'
 ```
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `trigr init` | Create config dirs and capture environment |
-| `trigr add <file.toml>` | Register task from TOML file |
-| `trigr create <name> --trigger ... --prompt/--command ...` | Create a task inline |
-| `trigr remove <name>` | Unload and delete a task |
-| `trigr enable/disable <name>` | Load/unload in launchd |
-| `trigr list [--json]` | Show all tasks with status |
-| `trigr show <name> [--json]` | Show full task config |
-| `trigr logs [name] [-n 20] [--json]` | Show run history |
-| `trigr output <name> [--stderr]` | Show last run's output |
-| `trigr run <name>` | Execute a task immediately |
-| `trigr edit <name>` | Edit TOML in $EDITOR, re-validate on save |
-| `trigr validate <file.toml>` | Check a TOML file without registering |
-| `trigr refresh` | Re-capture env and regenerate all plists |
-| `trigr status [--json]` | Show currently-running tasks |
-| `trigr clean [--older-than 30]` | Purge old run data |
+| `trigr init` | Create `trigr.toml` in the current directory |
+| `trigr serve [-f]` | Start server (detached by default, `-f` foreground) |
+| `trigr watch [--timeout 300]` | Block until event, print JSON, exit |
+| `trigr emit <type> [--data '{}'] [--delay 10s]` | Push event to queue |
+| `trigr add <name> -c "cmd" (--interval N \| --cron "...")` | Add poller/cron to config |
+| `trigr status` | Show server state |
+
+### Delayed Events
+
+```bash
+# Deliver event in 2 hours
+trigr emit reminder --data '{"task": "review PR"}' --delay 2h
+
+# Supported units: s (seconds), m (minutes), h (hours), d (days)
+```
 
 ## How It Works
 
 ```
-TOML task → trigr add → launchd plist → launchd fires → trigr run → LLM/script → log + notify
+trigr serve → FastAPI server + APScheduler
+                ├── POST /emit    (push events to priority queue)
+                ├── GET  /next    (long-poll, blocks until event ready)
+                └── GET  /status  (queue depth, registered jobs)
 ```
 
-trigr compiles your task definitions into native `launchd` plists. When a trigger fires, launchd calls `trigr run`, which executes the prompt or command, records the result in SQLite, and sends a macOS notification.
+Events are stored in an in-memory priority queue sorted by delivery time. `GET /next` blocks until an event is available whose `fire_at` time has passed, then returns it as JSON.
 
-Environment is captured at `trigr init` time and baked into plists — so your LLM CLIs work reliably even when invoked by launchd. Run `trigr refresh` after PATH changes or upgrading trigr.
+The server auto-starts when you run `trigr watch` or `trigr emit`. A `.trigr.pid` file is written next to `trigr.toml`, so multiple projects can run their own server on different ports.
 
 ## License
 

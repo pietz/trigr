@@ -1,122 +1,104 @@
+from datetime import datetime
+
 import pytest
 from pydantic import ValidationError
 
 from trigr.models import (
-    ActionConfig,
-    CronSchedule,
-    TaskConfig,
-    TriggerConfig,
-    TriggerType,
+    CronConfig,
+    EmitRequest,
+    Event,
+    PollerConfig,
+    ServerConfig,
+    TrigrConfig,
 )
 
 
-def test_cron_trigger_valid():
-    t = TriggerConfig(type=TriggerType.cron, cron=CronSchedule(hour=7, minute=0))
-    assert t.type == TriggerType.cron
-    assert t.cron.hour == 7
+class TestServerConfig:
+    def test_defaults(self) -> None:
+        cfg = ServerConfig()
+        assert cfg.host == "127.0.0.1"
+        assert cfg.port == 9374
+
+    def test_custom(self) -> None:
+        cfg = ServerConfig(host="0.0.0.0", port=8080)
+        assert cfg.host == "0.0.0.0"
+        assert cfg.port == 8080
 
 
-def test_cron_trigger_missing_cron():
-    with pytest.raises(ValidationError, match="cron trigger requires"):
-        TriggerConfig(type=TriggerType.cron)
+class TestPollerConfig:
+    def test_valid(self) -> None:
+        p = PollerConfig(interval=60, command="echo hi")
+        assert p.interval == 60
+        assert p.command == "echo hi"
+
+    def test_missing_interval(self) -> None:
+        with pytest.raises(ValidationError):
+            PollerConfig(command="echo hi")  # type: ignore[call-arg]
+
+    def test_missing_command(self) -> None:
+        with pytest.raises(ValidationError):
+            PollerConfig(interval=60)  # type: ignore[call-arg]
 
 
-def test_interval_trigger_valid():
-    t = TriggerConfig(type=TriggerType.interval, interval_seconds=60)
-    assert t.interval_seconds == 60
+class TestCronConfig:
+    def test_valid(self) -> None:
+        c = CronConfig(cron="*/5 * * * *", command="date")
+        assert c.cron == "*/5 * * * *"
+
+    def test_missing_cron(self) -> None:
+        with pytest.raises(ValidationError):
+            CronConfig(command="date")  # type: ignore[call-arg]
 
 
-def test_interval_trigger_missing_seconds():
-    with pytest.raises(ValidationError, match="interval trigger requires"):
-        TriggerConfig(type=TriggerType.interval)
+class TestTrigrConfig:
+    def test_defaults(self) -> None:
+        cfg = TrigrConfig()
+        assert cfg.server.port == 9374
+        assert cfg.pollers == {}
+        assert cfg.crons == {}
+
+    def test_with_pollers_and_crons(self) -> None:
+        cfg = TrigrConfig(
+            pollers={"check": PollerConfig(interval=30, command="echo ok")},
+            crons={"daily": CronConfig(cron="0 9 * * *", command="date")},
+        )
+        assert "check" in cfg.pollers
+        assert cfg.pollers["check"].interval == 30
+        assert "daily" in cfg.crons
 
 
-def test_watch_trigger_valid():
-    t = TriggerConfig(type=TriggerType.watch, watch_paths=["/tmp/test"])
-    assert t.watch_paths == ["/tmp/test"]
+class TestEvent:
+    def test_defaults(self) -> None:
+        e = Event(type="test")
+        assert e.type == "test"
+        assert e.source == ""
+        assert e.data == {}
+        assert isinstance(e.timestamp, datetime)
+
+    def test_custom_timestamp(self) -> None:
+        ts = datetime(2025, 1, 1, 12, 0)
+        e = Event(type="test", timestamp=ts)
+        assert e.timestamp == ts
+
+    def test_with_data(self) -> None:
+        e = Event(type="test", source="poller", data={"key": "val"})
+        assert e.source == "poller"
+        assert e.data["key"] == "val"
 
 
-def test_watch_trigger_missing_paths():
-    with pytest.raises(ValidationError, match="watch trigger requires"):
-        TriggerConfig(type=TriggerType.watch)
+class TestEmitRequest:
+    def test_minimal(self) -> None:
+        r = EmitRequest(type="ping")
+        assert r.type == "ping"
+        assert r.data == {}
+        assert r.source == ""
+        assert r.fire_at is None
 
+    def test_with_fire_at(self) -> None:
+        ts = datetime(2025, 6, 1, 12, 0)
+        r = EmitRequest(type="ping", fire_at=ts)
+        assert r.fire_at == ts
 
-def test_script_action_valid():
-    a = ActionConfig(command="echo hello")
-    assert a.command == "echo hello"
-
-
-def test_script_action_missing_both():
-    with pytest.raises(ValidationError, match="action requires either command or prompt"):
-        ActionConfig()
-
-
-def test_prompt_action_valid():
-    a = ActionConfig(prompt="do stuff")
-    assert a.prompt == "do stuff"
-
-
-def test_prompt_action_with_provider():
-    a = ActionConfig(prompt="do stuff", provider="gemini")
-    assert a.provider == "gemini"
-
-
-def test_prompt_action_with_model():
-    a = ActionConfig(prompt="do stuff", provider="codex", model="gpt-5.2")
-    assert a.model == "gpt-5.2"
-
-
-def test_both_command_and_prompt():
-    with pytest.raises(ValidationError, match="cannot have both command and prompt"):
-        ActionConfig(command="echo hi", prompt="do stuff")
-
-
-def test_provider_without_prompt():
-    with pytest.raises(ValidationError, match="provider requires prompt"):
-        ActionConfig(command="echo hi", provider="claude")
-
-
-def test_model_without_prompt():
-    with pytest.raises(ValidationError, match="model requires prompt"):
-        ActionConfig(command="echo hi", model="gpt-5")
-
-
-def test_unknown_provider():
-    with pytest.raises(ValidationError, match="unknown provider"):
-        ActionConfig(prompt="do stuff", provider="openai")
-
-
-def test_full_task_config():
-    task = TaskConfig(
-        name="test-task",
-        description="A test",
-        trigger=TriggerConfig(type=TriggerType.interval, interval_seconds=60),
-        action=ActionConfig(command="echo hi"),
-    )
-    assert task.name == "test-task"
-    assert task.enabled is True
-    assert task.notify.on_failure is True
-    assert task.notify.on_success is False
-
-
-def test_action_env_default():
-    a = ActionConfig(command="echo hi")
-    assert a.env == {}
-
-
-def test_action_env_set():
-    a = ActionConfig(command="echo hi", env={"API_KEY": "sk-123", "VERBOSE": "1"})
-    assert a.env["API_KEY"] == "sk-123"
-    assert a.env["VERBOSE"] == "1"
-
-
-def test_notify_max_consecutive_failures_default():
-    from trigr.models import NotifyConfig
-    n = NotifyConfig()
-    assert n.max_consecutive_failures == 0
-
-
-def test_notify_max_consecutive_failures_set():
-    from trigr.models import NotifyConfig
-    n = NotifyConfig(max_consecutive_failures=5)
-    assert n.max_consecutive_failures == 5
+    def test_missing_type(self) -> None:
+        with pytest.raises(ValidationError):
+            EmitRequest()  # type: ignore[call-arg]
