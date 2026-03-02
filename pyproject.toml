@@ -1,8 +1,22 @@
 [project]
 name = "trigr"
-version = "1.0.0"
+version = "1.0.1"
 description = "Event system for AI CLI agents"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
+authors = [
+    { name = "Peter Rosenberg" },
+]
+keywords = ["ai", "agents", "events", "cli", "claude", "codex", "gemini"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
 dependencies = [
     "typer>=0.16.0",
     "pydantic>=2.11.0",
@@ -13,6 +27,11 @@ dependencies = [
     "apscheduler>=3.11.0",
     "httpx>=0.28.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/pietz/trigr"
+Repository = "https://github.com/pietz/trigr"
+Issues = "https://github.com/pietz/trigr/issues"
 
 [project.scripts]
 trigr = "trigr.cli:main"
