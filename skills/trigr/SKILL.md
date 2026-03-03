@@ -76,13 +76,16 @@ If a command prints nothing, no message is created. Pollers silently skip cycles
 
 | Command | What it does |
 |---------|-------------|
-| `trigr watch [--timeout 0]` | Block until message, print it, exit (0 = forever) |
+| `trigr watch [--timeout 0] [--verbose]` | Block until message, print it, exit (0 = forever) |
 | `trigr emit ["msg"] [--delay 10s]` | Send a message (reads stdin if no arg) |
+| `trigr run <name>` | Run a poller/cron command once and show its output |
+| `trigr list` | List configured pollers and crons |
 | `trigr add <name> --cron "..." --message "..."` | Add a cron job |
 | `trigr add <name> --interval N --command "..."` | Add a poller |
+| `trigr remove <name>` | Remove a poller or cron |
 | `trigr status` | Show server state and scheduled jobs |
 | `trigr init [--token]` | Create trigr.toml (--token adds auth) |
-| `trigr serve [-f] [--no-auth]` | Start server manually |
+| `trigr serve [-f] [--verbose] [--no-auth]` | Start server manually |
 
 All commands accept `--port N` to override the default port (9374).
 
@@ -108,7 +111,10 @@ command = "echo 'time for the daily report'"
 ## Tips
 
 - The server auto-starts on `trigr watch` or `trigr emit` — no manual setup needed
+- Use `trigr run <name>` to test a poller/cron command without the server
+- Use `trigr list` to see what's configured in trigr.toml
 - Use `trigr status` to see queue depth and scheduled jobs
+- Use `--verbose` on `watch` or `serve` to enable debug logging (logs go to .trigr.log)
 - Multiple projects can run independent servers on different ports
 - Pollers auto-deduplicate: identical consecutive output is silently skipped
 - Use `--delay` on `trigr emit` for self-scheduled follow-ups

@@ -296,9 +296,9 @@ class TestWatch:
 
 
 class TestStatus:
-    @patch("trigr.cli._ensure_server_running")
+    @patch("trigr.cli._is_server_running", return_value=True)
     @patch("trigr.cli.httpx.get")
-    def test_status_display(self, mock_get: MagicMock, mock_ensure: MagicMock, tmp_path: Path, monkeypatch: object) -> None:
+    def test_status_display(self, mock_get: MagicMock, mock_running: MagicMock, tmp_path: Path, monkeypatch: object) -> None:
         monkeypatch.setattr("trigr.cli.Path.cwd", lambda: tmp_path)  # type: ignore[attr-defined]
         mock_get.return_value = MagicMock(
             status_code=200,
@@ -308,13 +308,12 @@ class TestStatus:
         assert result.exit_code == 0
         assert "running" in result.output
 
-    @patch("trigr.cli._ensure_server_running")
-    @patch("trigr.cli.httpx.get", side_effect=__import__("httpx").ConnectError("refused"))
-    def test_status_connect_error(self, mock_get: MagicMock, mock_ensure: MagicMock, tmp_path: Path, monkeypatch: object) -> None:
+    @patch("trigr.cli._is_server_running", return_value=False)
+    def test_status_not_running(self, mock_running: MagicMock, tmp_path: Path, monkeypatch: object) -> None:
         monkeypatch.setattr("trigr.cli.Path.cwd", lambda: tmp_path)  # type: ignore[attr-defined]
         result = runner.invoke(app, ["status"])
         assert result.exit_code == 1
-        assert "Could not connect" in result.output
+        assert "not running" in result.output
 
 
 class TestServeAuth:

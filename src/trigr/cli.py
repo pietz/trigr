@@ -115,7 +115,7 @@ def _validate_cron(expr: str) -> None:
         raise typer.BadParameter(f"Invalid cron expression {expr!r}: {e}")
 
 
-def _start_detached(port: int | None = None, verbose: bool = False) -> int:
+def _start_detached(port: int | None = None, verbose: bool = False, no_auth: bool = False) -> int:
     """Spawn 'trigr serve -f' as a background process. Returns PID."""
     trigr_bin = sys.argv[0] if os.path.isfile(sys.argv[0]) else "trigr"
     cmd = [trigr_bin, "serve", "-f"]
@@ -123,6 +123,8 @@ def _start_detached(port: int | None = None, verbose: bool = False) -> int:
         cmd.extend(["--port", str(port)])
     if verbose:
         cmd.append("--verbose")
+    if no_auth:
+        cmd.append("--no-auth")
     log_file = open(_log_path(), "a")
     proc = subprocess.Popen(
         cmd,
@@ -152,12 +154,20 @@ def _ensure_config() -> None:
         path.write_text(DEFAULT_CONFIG)
 
 
-def _ensure_server_running(port: int | None = None) -> None:
+def _ensure_server_running(port: int | None = None, verbose: bool = False) -> None:
     """Auto-start server if not running, wait up to 3s."""
     _ensure_config()
     if _is_server_running(port):
         return
-    pid = _start_detached(port)
+    # Clean up stale PID file if the process is no longer alive
+    pid_file = _pid_path()
+    if pid_file.exists():
+        try:
+            old_pid = int(pid_file.read_text().strip())
+            os.kill(old_pid, 0)  # check if alive (no signal sent)
+        except (ValueError, ProcessLookupError):
+            pid_file.unlink(missing_ok=True)
+    pid = _start_detached(port, verbose=verbose)
     console.print(f"Started trigr server (PID {pid})", style="dim")
     for _ in range(30):
         time.sleep(0.1)
@@ -231,7 +241,7 @@ def serve(
         )
     else:
         _ensure_config()
-        pid = _start_detached(port, verbose=verbose)
+        pid = _start_detached(port, verbose=verbose, no_auth=no_auth)
         console.print(f"trigr server started (PID {pid})", style="green")
         time.sleep(0.5)
         if _is_server_running(port):
@@ -281,9 +291,10 @@ def stop(
 def watch(
     timeout: int = typer.Option(0, "--timeout", "-t", help="Timeout in seconds (0 = wait forever)"),
     port: int | None = typer.Option(None, "--port", "-p", help="Server port"),
+    verbose: bool = typer.Option(False, "--verbose", help="Enable debug logging on auto-started server"),
 ) -> None:
     """Block until a message arrives, print it, then exit."""
-    _ensure_server_running(port)
+    _ensure_server_running(port, verbose=verbose)
     params = {"timeout": timeout} if timeout > 0 else {}
     http_timeout = timeout + 5 if timeout > 0 else None
     try:
@@ -423,11 +434,70 @@ def remove_cmd(
 
 
 @app.command()
+def run(
+    name: str = typer.Argument(..., help="Name of the poller/cron to run"),
+) -> None:
+    """Run a poller or cron command once and show its output."""
+    data = _load_toml()
+    pollers = data.get("pollers", {})
+    crons = data.get("crons", {})
+
+    if name in pollers:
+        command = pollers[name]["command"]
+    elif name in crons:
+        command = crons[name]["command"]
+    else:
+        console.print(f"No poller or cron named '{name}' found.", style="red")
+        raise typer.Exit(1)
+
+    console.print(f"Running: {command}", style="dim")
+    import subprocess as sp
+    result = sp.run(command, shell=True, capture_output=True, timeout=30)
+
+    stdout = result.stdout.decode().strip()
+    stderr = result.stderr.decode().strip()
+
+    if stderr:
+        console.print(f"[bold]stderr:[/bold]\n{stderr}")
+
+    if not stdout:
+        console.print("No output (empty stdout → no event would be created).", style="yellow")
+        return
+
+    console.print(f"[bold]output:[/bold]\n{stdout}")
+    console.print(f"\n[green]This output ({len(stdout)} chars) would become an event message.[/green]")
+
+
+@app.command(name="list")
+def list_cmd() -> None:
+    """List configured pollers and crons from trigr.toml."""
+    data = _load_toml()
+    pollers = data.get("pollers", {})
+    crons = data.get("crons", {})
+
+    if not pollers and not crons:
+        console.print("No pollers or crons configured.", style="yellow")
+        return
+
+    if pollers:
+        console.print("[bold]Pollers:[/bold]")
+        for name, cfg in pollers.items():
+            console.print(f"  {name} — every {cfg['interval']}s — {cfg['command']}")
+
+    if crons:
+        console.print("[bold]Crons:[/bold]")
+        for name, cfg in crons.items():
+            console.print(f"  {name} — {cfg['cron']} — {cfg['command']}")
+
+
+@app.command()
 def status(
     port: int | None = typer.Option(None, "--port", "-p", help="Server port"),
 ) -> None:
     """Show server status."""
-    _ensure_server_running(port)
+    if not _is_server_running(port):
+        console.print("Server is not running.", style="yellow")
+        raise typer.Exit(1)
     try:
         resp = httpx.get(f"{_server_url(port)}/status", timeout=5, headers=_auth_headers())
         data = resp.json()
