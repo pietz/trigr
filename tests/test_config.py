@@ -1,7 +1,6 @@
 from pathlib import Path
 
-from trigr.config import find_config, load_config, server_url
-from trigr.models import TrigrConfig, ServerConfig
+from trigr.config import find_config, load_config
 
 
 class TestFindConfig:
@@ -34,12 +33,3 @@ class TestLoadConfig:
         assert cfg.server.port == 8080
         assert "check" in cfg.pollers
         assert cfg.pollers["check"].interval == 10
-
-
-class TestServerUrl:
-    def test_default(self) -> None:
-        assert server_url(TrigrConfig()) == "http://127.0.0.1:9374"
-
-    def test_custom(self) -> None:
-        cfg = TrigrConfig(server=ServerConfig(host="0.0.0.0", port=8080))
-        assert server_url(cfg) == "http://0.0.0.0:8080"

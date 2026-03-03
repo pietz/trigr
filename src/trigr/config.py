@@ -18,10 +18,3 @@ def load_config() -> TrigrConfig:
     with open(path, "rb") as f:
         data = tomllib.load(f)
     return TrigrConfig(**data)
-
-
-def server_url(config: TrigrConfig | None = None) -> str:
-    """Build http://host:port string."""
-    if config is None:
-        config = load_config()
-    return f"http://{config.server.host}:{config.server.port}"

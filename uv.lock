@@ -380,7 +380,7 @@ wheels = [
 
 [[package]]
 name = "trigr"
-version = "1.0.2"
+version = "1.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "apscheduler" },
@@ -402,7 +402,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "apscheduler", specifier = ">=3.11.0" },
+    { name = "apscheduler", specifier = ">=3.11.0,<4" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "pydantic", specifier = ">=2.11.0" },

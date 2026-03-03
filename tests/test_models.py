@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -18,11 +18,16 @@ class TestServerConfig:
         cfg = ServerConfig()
         assert cfg.host == "127.0.0.1"
         assert cfg.port == 9374
+        assert cfg.token is None
 
     def test_custom(self) -> None:
         cfg = ServerConfig(host="0.0.0.0", port=8080)
         assert cfg.host == "0.0.0.0"
         assert cfg.port == 8080
+
+    def test_with_token(self) -> None:
+        cfg = ServerConfig(token="my-secret")
+        assert cfg.token == "my-secret"
 
 
 class TestPollerConfig:
@@ -73,8 +78,13 @@ class TestEvent:
         assert e.message == "hello"
         assert isinstance(e.timestamp, datetime)
 
+    def test_timestamp_is_utc(self) -> None:
+        e = Event(message="hello")
+        assert e.timestamp.tzinfo is not None
+        assert e.timestamp.tzinfo == timezone.utc
+
     def test_custom_timestamp(self) -> None:
-        ts = datetime(2025, 1, 1, 12, 0)
+        ts = datetime(2025, 1, 1, 12, 0, tzinfo=timezone.utc)
         e = Event(message="hello", timestamp=ts)
         assert e.timestamp == ts
 

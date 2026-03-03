@@ -1,11 +1,12 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 9374
+    token: str | None = None
 
 
 class PollerConfig(BaseModel):
@@ -26,12 +27,7 @@ class TrigrConfig(BaseModel):
 
 class Event(BaseModel):
     message: str
-    timestamp: datetime = None  # type: ignore[assignment]
-
-    def __init__(self, **kwargs: object) -> None:
-        if "timestamp" not in kwargs or kwargs["timestamp"] is None:
-            kwargs["timestamp"] = datetime.now()
-        super().__init__(**kwargs)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
 
 
 class EmitRequest(BaseModel):

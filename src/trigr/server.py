@@ -1,14 +1,14 @@
 import asyncio
 import logging
-import subprocess
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import AsyncIterator
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from trigr.config import load_config
 from trigr.models import EmitRequest, Event, TrigrConfig
@@ -20,6 +20,8 @@ _queue: asyncio.PriorityQueue[tuple[datetime, int, Event]] = asyncio.PriorityQue
 _seq = 0
 _scheduler: AsyncIOScheduler | None = None
 _config: TrigrConfig = TrigrConfig()
+_delayed_tasks: set[asyncio.Task] = set()
+_last_poller_output: dict[str, str] = {}
 
 
 def _next_seq() -> int:
@@ -28,10 +30,24 @@ def _next_seq() -> int:
     return _seq
 
 
+async def _deliver_delayed(event: Event, fire_at: datetime, seq: int) -> None:
+    """Sleep until fire_at, then put event into the ready queue."""
+    delay = (fire_at - datetime.now(tz=timezone.utc)).total_seconds()
+    if delay > 0:
+        await asyncio.sleep(delay)
+    _queue.put_nowait((fire_at, seq, event))
+
+
 async def enqueue(event: Event, fire_at: datetime | None = None) -> None:
     """Push an event onto the priority queue."""
     when = fire_at or event.timestamp
-    _queue.put_nowait((when, _next_seq(), event))
+    seq = _next_seq()
+    if when > datetime.now(tz=timezone.utc):
+        task = asyncio.create_task(_deliver_delayed(event, when, seq))
+        _delayed_tasks.add(task)
+        task.add_done_callback(_delayed_tasks.discard)
+    else:
+        _queue.put_nowait((when, seq, event))
 
 
 def _parse_cron(expr: str) -> CronTrigger:
@@ -49,23 +65,41 @@ def _parse_cron(expr: str) -> CronTrigger:
     )
 
 
-def _run_poller_command(name: str, command: str) -> None:
-    """Run a poller command synchronously and enqueue its output."""
+async def _run_poller_command(name: str, command: str) -> None:
+    """Run a poller command asynchronously and enqueue its output."""
     try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=30,
+        logger.debug("Poller %s running: %s", name, command)
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        stdout = result.stdout.strip()
-        if not stdout:
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            logger.warning("Poller %s timed out", name)
             return
 
-        event = Event(message=stdout)
-        loop = asyncio.get_event_loop()
-        loop.call_soon_threadsafe(
-            lambda e=event: _queue.put_nowait((e.timestamp, _next_seq(), e)),
-        )
-    except subprocess.TimeoutExpired:
-        logger.warning("Poller %s timed out", name)
+        if stderr:
+            logger.debug("Poller %s stderr: %s", name, stderr.decode().strip())
+
+        output = stdout.decode().strip()
+        logger.debug("Poller %s output: %d chars", name, len(output))
+        if not output:
+            logger.debug("Poller %s: empty output, skipping", name)
+            return
+
+        # Deduplicate: skip if output is identical to last run
+        if _last_poller_output.get(name) == output:
+            logger.debug("Poller %s: deduplicated, skipping", name)
+            return
+        _last_poller_output[name] = output
+
+        event = Event(message=output)
+        await enqueue(event)
+        logger.debug("Poller %s: event enqueued", name)
     except Exception:
         logger.exception("Poller %s failed", name)
 
@@ -103,10 +137,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("trigr server started on %s:%d", _config.server.host, _config.server.port)
     yield
     _scheduler.shutdown(wait=False)
+    for task in _delayed_tasks:
+        task.cancel()
+    _delayed_tasks.clear()
+    _last_poller_output.clear()
     logger.info("trigr server stopped")
 
 
 app = FastAPI(title="trigr", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """Check Bearer token when server has a token configured."""
+    token = _config.server.token
+    if token:
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {token}":
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
 
 
 @app.post("/emit")
@@ -117,30 +166,15 @@ async def emit(req: EmitRequest) -> dict:
 
 
 @app.get("/next")
-async def next_event(timeout: int = 300) -> dict:
-    deadline = asyncio.get_event_loop().time() + timeout
-    while True:
-        remaining = deadline - asyncio.get_event_loop().time()
-        if remaining <= 0:
-            return {"status": "timeout"}
-        try:
-            fire_at, seq, event = await asyncio.wait_for(
-                _queue.get(), timeout=min(remaining, 1.0),
-            )
-        except asyncio.TimeoutError:
-            continue
-
-        # Check if event should fire yet
-        now = datetime.now()
-        if fire_at > now:
-            # Put it back and wait
-            _queue.put_nowait((fire_at, seq, event))
-            wait_secs = min((fire_at - now).total_seconds(), remaining)
-            if wait_secs > 0:
-                await asyncio.sleep(min(wait_secs, 1.0))
-            continue
-
+async def next_event(timeout: int = 0) -> dict:
+    try:
+        if timeout <= 0:
+            fire_at, seq, event = await _queue.get()
+        else:
+            fire_at, seq, event = await asyncio.wait_for(_queue.get(), timeout=timeout)
         return event.model_dump(mode="json")
+    except asyncio.TimeoutError:
+        return {"status": "timeout"}
 
 
 @app.get("/status")

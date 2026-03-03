@@ -1,9 +1,11 @@
 import os
 import re
+import secrets
+import signal
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 
@@ -22,6 +24,7 @@ DEFAULT_CONFIG = """\
 [server]
 host = "127.0.0.1"
 port = 9374
+# token = "your-secret-token"
 
 # [pollers.example]
 # interval = 60
@@ -57,6 +60,10 @@ def _pid_path() -> Path:
     return Path.cwd() / ".trigr.pid"
 
 
+def _log_path() -> Path:
+    return Path.cwd() / ".trigr.log"
+
+
 def _load_toml() -> dict:
     path = _config_path()
     if not path.exists():
@@ -73,6 +80,15 @@ def _server_url(port: int | None = None) -> str:
     return f"http://{host}:{resolved_port}"
 
 
+def _auth_headers() -> dict[str, str]:
+    """Return Authorization header if token is configured."""
+    data = _load_toml()
+    token = data.get("server", {}).get("token")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
 def _parse_delay(delay: str) -> datetime:
     """Convert '48h', '30m', '5s' to absolute datetime."""
     match = re.fullmatch(r"(\d+)([smhd])", delay.strip())
@@ -82,22 +98,40 @@ def _parse_delay(delay: str) -> datetime:
     unit = match.group(2)
     delta = {"s": timedelta(seconds=value), "m": timedelta(minutes=value),
              "h": timedelta(hours=value), "d": timedelta(days=value)}[unit]
-    return datetime.now() + delta
+    return datetime.now(tz=timezone.utc) + delta
 
 
-def _start_detached(port: int | None = None) -> int:
+def _validate_cron(expr: str) -> None:
+    """Validate a 5-field cron expression at add-time."""
+    from apscheduler.triggers.cron import CronTrigger
+
+    parts = expr.strip().split()
+    if len(parts) != 5:
+        raise typer.BadParameter(f"Expected 5-field cron expression, got {len(parts)} fields: {expr!r}")
+    minute, hour, day, month, day_of_week = parts
+    try:
+        CronTrigger(minute=minute, hour=hour, day=day, month=month, day_of_week=day_of_week)
+    except (ValueError, KeyError) as e:
+        raise typer.BadParameter(f"Invalid cron expression {expr!r}: {e}")
+
+
+def _start_detached(port: int | None = None, verbose: bool = False) -> int:
     """Spawn 'trigr serve -f' as a background process. Returns PID."""
     trigr_bin = sys.argv[0] if os.path.isfile(sys.argv[0]) else "trigr"
     cmd = [trigr_bin, "serve", "-f"]
     if port:
         cmd.extend(["--port", str(port)])
+    if verbose:
+        cmd.append("--verbose")
+    log_file = open(_log_path(), "a")
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=log_file,
         start_new_session=True,
         cwd=Path.cwd(),
     )
+    log_file.close()
     _pid_path().write_text(str(proc.pid))
     return proc.pid
 
@@ -105,7 +139,7 @@ def _start_detached(port: int | None = None) -> int:
 def _is_server_running(port: int | None = None) -> bool:
     """Check if server is reachable."""
     try:
-        resp = httpx.get(f"{_server_url(port)}/status", timeout=2)
+        resp = httpx.get(f"{_server_url(port)}/status", timeout=2, headers=_auth_headers())
         return resp.status_code == 200
     except (httpx.ConnectError, httpx.TimeoutException):
         return False
@@ -129,60 +163,135 @@ def _ensure_server_running(port: int | None = None) -> None:
         time.sleep(0.1)
         if _is_server_running(port):
             return
-    console.print("Warning: server may not have started in time.", style="yellow")
+    console.print(f"Warning: server may not have started. Check {_log_path()} for details.", style="yellow")
 
 
 @app.command(name="init")
-def init_cmd() -> None:
+def init_cmd(
+    token: bool = typer.Option(False, "--token", help="Generate a random auth token"),
+) -> None:
     """Create trigr.toml in the current directory."""
     path = _config_path()
     if path.exists():
         console.print("trigr.toml already exists.", style="red")
         raise typer.Exit(1)
-    path.write_text(DEFAULT_CONFIG)
-    console.print("Created trigr.toml", style="green")
+    if token:
+        generated = secrets.token_urlsafe(32)
+        config_text = DEFAULT_CONFIG.replace(
+            '# token = "your-secret-token"',
+            f'token = "{generated}"',
+        )
+        path.write_text(config_text)
+        console.print(f"Created trigr.toml with auth token", style="green")
+    else:
+        path.write_text(DEFAULT_CONFIG)
+        console.print("Created trigr.toml", style="green")
 
 
 @app.command()
 def serve(
     foreground: bool = typer.Option(False, "-f", "--foreground", help="Run in foreground"),
     port: int | None = typer.Option(None, "--port", "-p", help="Port to listen on"),
+    no_auth: bool = typer.Option(False, "--no-auth", help="Allow non-localhost without token (unsafe)"),
+    verbose: bool = typer.Option(False, "--verbose", help="Enable debug logging"),
 ) -> None:
     """Start the trigr server."""
     if foreground:
+        import logging
         import uvicorn
         from trigr.config import load_config
+
+        if verbose:
+            logging.getLogger("trigr").setLevel(logging.DEBUG)
+
         config = load_config()
         resolved_port = port or config.server.port
+
+        # Refuse to bind non-localhost without auth
+        is_localhost = config.server.host in ("127.0.0.1", "localhost")
+        if not is_localhost and not config.server.token and not no_auth:
+            console.print(
+                "Refusing to bind to non-localhost without a token.\n"
+                "Set 'token' in trigr.toml or pass --no-auth to override.",
+                style="red",
+            )
+            raise typer.Exit(1)
+        if not is_localhost and not config.server.token and no_auth:
+            console.print(
+                "WARNING: Running without auth on a non-localhost address. "
+                "Anyone on the network can send events.",
+                style="bold yellow",
+            )
+
         uvicorn.run(
             "trigr.server:app",
             host=config.server.host,
             port=resolved_port,
-            log_level="info",
+            log_level="debug" if verbose else "info",
         )
     else:
         _ensure_config()
-        pid = _start_detached(port)
+        pid = _start_detached(port, verbose=verbose)
         console.print(f"trigr server started (PID {pid})", style="green")
         time.sleep(0.5)
         if _is_server_running(port):
             console.print(f"Listening on {_server_url(port)}", style="dim")
         else:
-            console.print("Warning: server may not have started yet.", style="yellow")
+            console.print(f"Warning: server may not have started. Check {_log_path()} for details.", style="yellow")
+
+
+@app.command()
+def stop(
+    port: int | None = typer.Option(None, "--port", "-p", help="Server port"),
+) -> None:
+    """Stop the trigr server."""
+    pid_file = _pid_path()
+
+    if not _is_server_running(port) and not pid_file.exists():
+        console.print("No trigr server is running.", style="yellow")
+        return
+
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+        except ValueError:
+            pid_file.unlink()
+            console.print("Corrupt PID file removed.", style="yellow")
+            return
+
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+        for _ in range(30):
+            time.sleep(0.1)
+            if not _is_server_running(port):
+                break
+
+    if _is_server_running(port):
+        console.print("Server is still running.", style="red")
+        raise typer.Exit(1)
+
+    pid_file.unlink(missing_ok=True)
+    console.print("Stopped trigr server.", style="green")
 
 
 @app.command()
 def watch(
-    timeout: int = typer.Option(300, "--timeout", "-t", help="Timeout in seconds"),
+    timeout: int = typer.Option(0, "--timeout", "-t", help="Timeout in seconds (0 = wait forever)"),
     port: int | None = typer.Option(None, "--port", "-p", help="Server port"),
 ) -> None:
     """Block until a message arrives, print it, then exit."""
     _ensure_server_running(port)
+    params = {"timeout": timeout} if timeout > 0 else {}
+    http_timeout = timeout + 5 if timeout > 0 else None
     try:
         resp = httpx.get(
             f"{_server_url(port)}/next",
-            params={"timeout": timeout},
-            timeout=timeout + 5,
+            params=params,
+            timeout=http_timeout,
+            headers=_auth_headers(),
         )
         data = resp.json()
         if data.get("status") == "timeout":
@@ -195,11 +304,18 @@ def watch(
 
 @app.command()
 def emit(
-    message: str = typer.Argument(..., help="Message to send to the agent"),
+    message: str | None = typer.Argument(None, help="Message to send (reads stdin if omitted)"),
     delay: str | None = typer.Option(None, "--delay", help="Delay before delivery (e.g. 10s, 5m, 2h)"),
     port: int | None = typer.Option(None, "--port", "-p", help="Server port"),
 ) -> None:
     """Send a message to the agent."""
+    if message is None:
+        if not sys.stdin.isatty():
+            message = sys.stdin.read().strip()
+        if not message:
+            console.print("No message provided. Pass as argument or pipe via stdin.", style="red")
+            raise typer.Exit(1)
+
     _ensure_server_running(port)
 
     payload: dict = {"message": message}
@@ -207,7 +323,12 @@ def emit(
         payload["fire_at"] = _parse_delay(delay).isoformat()
 
     try:
-        resp = httpx.post(f"{_server_url(port)}/emit", json=payload, timeout=5)
+        resp = httpx.post(
+            f"{_server_url(port)}/emit",
+            json=payload,
+            timeout=5,
+            headers=_auth_headers(),
+        )
         if resp.status_code == 200:
             console.print("Emitted", style="green")
         else:
@@ -227,15 +348,18 @@ def add_cmd(
     cron: str | None = typer.Option(None, "--cron", help="Cron expression (5-field)"),
 ) -> None:
     """Add a poller or cron job to trigr.toml."""
-    if not interval and not cron:
+    if interval is None and not cron:
         console.print("Provide either --interval or --cron.", style="red")
         raise typer.Exit(1)
-    if interval and cron:
+    if interval is not None and cron:
         console.print("Provide only one of --interval or --cron.", style="red")
         raise typer.Exit(1)
     if not command and not message:
         console.print("Provide either --command or --message (or both).", style="red")
         raise typer.Exit(1)
+
+    if cron:
+        _validate_cron(cron)
 
     # Build command: message first, then command output
     parts = []
@@ -254,7 +378,7 @@ def add_cmd(
     with open(path, "rb") as f:
         data = tomllib.load(f)
 
-    if interval:
+    if interval is not None:
         pollers = data.setdefault("pollers", {})
         if name in pollers:
             console.print(f"Poller '{name}' already exists.", style="red")
@@ -270,7 +394,32 @@ def add_cmd(
         label = f"cron '{name}' ({cron})"
 
     path.write_bytes(tomli_w.dumps(data).encode())
-    console.print(f"Added {label}", style="green")
+    console.print(f"Added {label}. Restart the server to apply.", style="green")
+
+
+@app.command(name="remove")
+def remove_cmd(
+    name: str = typer.Argument(..., help="Name of the poller/cron to remove"),
+) -> None:
+    """Remove a poller or cron job from trigr.toml."""
+    path = _config_path()
+    if not path.exists():
+        console.print("No trigr.toml found.", style="red")
+        raise typer.Exit(1)
+
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    if name in data.get("pollers", {}):
+        del data["pollers"][name]
+    elif name in data.get("crons", {}):
+        del data["crons"][name]
+    else:
+        console.print(f"No poller or cron named '{name}' found.", style="red")
+        raise typer.Exit(1)
+
+    path.write_bytes(tomli_w.dumps(data).encode())
+    console.print(f"Removed '{name}'. Restart the server to apply.", style="green")
 
 
 @app.command()
@@ -280,7 +429,7 @@ def status(
     """Show server status."""
     _ensure_server_running(port)
     try:
-        resp = httpx.get(f"{_server_url(port)}/status", timeout=5)
+        resp = httpx.get(f"{_server_url(port)}/status", timeout=5, headers=_auth_headers())
         data = resp.json()
         console.print(f"Status: [green]{data['status']}[/green]")
         console.print(f"Queue depth: {data['queue_depth']}")

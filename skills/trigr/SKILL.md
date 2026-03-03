@@ -17,14 +17,14 @@ trigr is an event system that makes you autonomous. You can wait for external ev
 
 ```bash
 # Start watching (auto-creates config and starts server if needed)
-trigr watch --timeout 3600
+trigr watch
 ```
 
 ## Receiving Messages
 
 `trigr watch` blocks until a message arrives, prints it to stdout, and exits. Run it as a background task so you get notified when something happens.
 
-If no message arrives within the timeout (default 300s), it exits with code 1.
+By default it waits forever. Use `--timeout N` to set a deadline in seconds (exits with code 1 on timeout).
 
 ## Sending Messages
 
@@ -32,6 +32,13 @@ From your session, another terminal, or any script:
 
 ```bash
 trigr emit "New PR opened — please review"
+```
+
+You can also pipe from stdin:
+
+```bash
+echo "New PR opened" | trigr emit
+python check_status.py | trigr emit
 ```
 
 You can delay delivery:
@@ -69,13 +76,13 @@ If a command prints nothing, no message is created. Pollers silently skip cycles
 
 | Command | What it does |
 |---------|-------------|
-| `trigr watch [--timeout 300]` | Block until message, print it, exit |
-| `trigr emit "msg" [--delay 10s]` | Send a message |
+| `trigr watch [--timeout 0]` | Block until message, print it, exit (0 = forever) |
+| `trigr emit ["msg"] [--delay 10s]` | Send a message (reads stdin if no arg) |
 | `trigr add <name> --cron "..." --message "..."` | Add a cron job |
 | `trigr add <name> --interval N --command "..."` | Add a poller |
 | `trigr status` | Show server state and scheduled jobs |
-| `trigr init` | Create trigr.toml (auto-created on first use) |
-| `trigr serve [-f]` | Start server manually |
+| `trigr init [--token]` | Create trigr.toml (--token adds auth) |
+| `trigr serve [-f] [--no-auth]` | Start server manually |
 
 All commands accept `--port N` to override the default port (9374).
 
@@ -87,6 +94,7 @@ All commands accept `--port N` to override the default port (9374).
 [server]
 host = "127.0.0.1"
 port = 9374
+# token = "your-secret-token"  # required when host != 127.0.0.1
 
 [pollers.check-inbox]
 interval = 60
@@ -102,5 +110,5 @@ command = "echo 'time for the daily report'"
 - The server auto-starts on `trigr watch` or `trigr emit` — no manual setup needed
 - Use `trigr status` to see queue depth and scheduled jobs
 - Multiple projects can run independent servers on different ports
-- Pollers should manage their own state (track what they've already seen)
+- Pollers auto-deduplicate: identical consecutive output is silently skipped
 - Use `--delay` on `trigr emit` for self-scheduled follow-ups
