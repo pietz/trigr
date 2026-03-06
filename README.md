@@ -20,7 +20,7 @@ uv tool install trigr
 graph LR
     A[Register triggers] --> B[Agent goes to sleep]
     B --> C[Event fires]
-    C --> D[Agent works on task]
+    C --> D[Agent works]
     D --> B
 ```
 
