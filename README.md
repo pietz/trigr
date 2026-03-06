@@ -8,62 +8,50 @@ OpenClaw changes that by running agents in the background, but it's a full platf
 
 **trigr** bridges this gap through a simple trigger system. It lets the agent wait for events to autonomously run tasks when something happens. Once it's done, it goes back to sleep until the next event.
 
-## Quickstart
-
-1. The agent starts trigr as a background command.
-
-```bash
-uvx trigr watch
-# trigr server runs on port 9374 (default)
-```
-
-2. An external event is emitted.
-
-```bash
-uvx trigr emit "New GitHub issue opened: #1337 - Please triage."
-```
-
-3. The agent wakes up and runs the task.
-
 ## Install
 
 ```bash
 uv tool install trigr
 ```
 
-## Triggers
+## How It Works
 
-We currently support 3 types of triggers: messages, CRON jobs, and pollers.
+```mermaid
+graph LR
+    A[Register triggers] --> B[Agent goes to sleep]
+    B --> C[Event fires]
+    C --> D[Agent works on task]
+    D --> B
+```
 
-## Messages (External Triggers)
+1. **Register triggers** with `trigr add` — define CRON jobs or event pollers the agent should react to.
+2. **Agent goes to sleep** by running `trigr watch`, which starts a silent background server and blocks until an event arrives.
+3. **Event fires** — a message is sent, a cron job runs, or a poller detects a change.
+4. **Agent works on task** — it receives the message, acts on it, then calls `trigr watch` again to go back to sleep.
 
-You can send messages from another terminal, script, or the agent itself.
+### Messages
+
+Messages are the simplest trigger. You send one from another terminal, a script, or the agent itself, and the waiting agent receives it immediately.
 
 ```bash
 trigr emit "New GitHub issue opened: #1337 - Please triage."
 ```
 
-You can delay messages too, if you want the agent to wait before acting.
+You can also delay a message so the agent wakes up later.
 
 ```bash
-trigr emit "Check if the deployment ran successfully and fix if needed." --delay 20m
+trigr emit "Check if the deployment succeeded." --delay 20m
 ```
 
-## CRON Jobs (Scheduled Triggers)
+### Cron Jobs
 
-CRON jobs run at a specific time schedule.
-
-```bash
-trigr add daily-news --cron "0 9 * * *" --message "Retrieve the top 5 trending hacker news stories."
-```
-
-You can also prompt the agent to run a command and use its output as the message.
+Cron jobs fire on a schedule, like every morning at 9am. You can provide a static message or a command whose output becomes the message.
 
 ```bash
 trigr add daily-news --cron "0 9 * * *" --command "python daily_news.py"
 ```
 
-Instead of using the CLI, you can also define cron jobs in `trigr.toml`.
+Or define them in `trigr.toml`:
 
 ```toml
 [crons.daily-report]
@@ -71,15 +59,15 @@ cron = "0 9 * * *"
 command = "echo 'time for the daily report'"
 ```
 
-## Pollers (Interval Triggers)
+### Pollers
 
-Pollers run at regular intervals, like every 5 minutes to check your email.
+Pollers run a command at regular intervals and trigger an event when the output changes. If the command prints nothing, the cycle is silently skipped.
 
 ```bash
-trigr add email-response --interval 300 --command "./check_email.sh"
+trigr add check-inbox --interval 300 --command "./check_email.sh"
 ```
 
-If a command prints nothing, no message is created. Pollers silently skip cycles when nothing is new.
+Or in `trigr.toml`:
 
 ```toml
 [pollers.check-inbox]
