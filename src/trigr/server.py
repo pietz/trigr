@@ -82,7 +82,7 @@ async def _run_poller_command(name: str, command: str) -> None:
             logger.warning("Poller %s timed out", name)
             return
 
-        if stderr:
+        if stderr and logger.isEnabledFor(logging.DEBUG):
             logger.debug("Poller %s stderr: %s", name, stderr.decode().strip())
 
         output = stdout.decode().strip()

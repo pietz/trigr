@@ -101,6 +101,17 @@ def _parse_delay(delay: str) -> datetime:
     return datetime.now(tz=timezone.utc) + delta
 
 
+def _find_job(name: str) -> tuple[str, dict]:
+    """Look up a poller or cron by name. Returns (section, config) or exits."""
+    data = _load_toml()
+    for section in ("pollers", "crons"):
+        jobs = data.get(section, {})
+        if name in jobs:
+            return section, jobs[name]
+    console.print(f"No poller or cron named '{name}' found.", style="red")
+    raise typer.Exit(1)
+
+
 def _validate_cron(expr: str) -> None:
     """Validate a 5-field cron expression at add-time."""
     from apscheduler.triggers.cron import CronTrigger
@@ -160,13 +171,12 @@ def _ensure_server_running(port: int | None = None, verbose: bool = False) -> No
     if _is_server_running(port):
         return
     # Clean up stale PID file if the process is no longer alive
-    pid_file = _pid_path()
-    if pid_file.exists():
-        try:
-            old_pid = int(pid_file.read_text().strip())
-            os.kill(old_pid, 0)  # check if alive (no signal sent)
-        except (ValueError, ProcessLookupError):
-            pid_file.unlink(missing_ok=True)
+    try:
+        old_pid = int(_pid_path().read_text().strip())
+        os.kill(old_pid, 0)  # check if alive (no signal sent)
+        return  # process exists — server may be starting up
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        _pid_path().unlink(missing_ok=True)
     pid = _start_detached(port, verbose=verbose)
     console.print(f"Started trigr server (PID {pid})", style="dim")
     for _ in range(30):
@@ -413,22 +423,13 @@ def remove_cmd(
     name: str = typer.Argument(..., help="Name of the poller/cron to remove"),
 ) -> None:
     """Remove a poller or cron job from trigr.toml."""
-    path = _config_path()
-    if not path.exists():
-        console.print("No trigr.toml found.", style="red")
-        raise typer.Exit(1)
+    section, _ = _find_job(name)
 
+    path = _config_path()
     with open(path, "rb") as f:
         data = tomllib.load(f)
 
-    if name in data.get("pollers", {}):
-        del data["pollers"][name]
-    elif name in data.get("crons", {}):
-        del data["crons"][name]
-    else:
-        console.print(f"No poller or cron named '{name}' found.", style="red")
-        raise typer.Exit(1)
-
+    del data[section][name]
     path.write_bytes(tomli_w.dumps(data).encode())
     console.print(f"Removed '{name}'. Restart the server to apply.", style="green")
 
@@ -438,21 +439,11 @@ def run(
     name: str = typer.Argument(..., help="Name of the poller/cron to run"),
 ) -> None:
     """Run a poller or cron command once and show its output."""
-    data = _load_toml()
-    pollers = data.get("pollers", {})
-    crons = data.get("crons", {})
-
-    if name in pollers:
-        command = pollers[name]["command"]
-    elif name in crons:
-        command = crons[name]["command"]
-    else:
-        console.print(f"No poller or cron named '{name}' found.", style="red")
-        raise typer.Exit(1)
+    _, job = _find_job(name)
+    command = job["command"]
 
     console.print(f"Running: {command}", style="dim")
-    import subprocess as sp
-    result = sp.run(command, shell=True, capture_output=True, timeout=30)
+    result = subprocess.run(command, shell=True, capture_output=True, timeout=30)
 
     stdout = result.stdout.decode().strip()
     stderr = result.stderr.decode().strip()
